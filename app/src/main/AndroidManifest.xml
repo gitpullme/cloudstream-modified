@@ -54,6 +54,7 @@
         <package android:name="live.mehiz.mpvkt" />
         <package android:name="live.mehiz.mpvkt.preview" />
         <package android:name="com.brouken.player" />
+        <package android:name="com.genuine.leone" />
         <package android:name="dev.anilbeesetti.nextplayer" />
         <package android:name="com.instantbits.cast.webvideo" />
         <package android:name="com.gianlu.aria2android" />
@@ -283,6 +284,29 @@
             android:name=".services.PackageInstallerService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
+
+        <!-- Keeps the local HLS relay alive while an external player is in the foreground. -->
+        <service
+            android:name=".services.LocalStreamProxyService"
+            android:enabled="true"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+        <!--
+            Notification access is the Android permission gate for reading
+            MediaSession state. The service is bound by the system, so it must
+            be exported and protected by BIND_NOTIFICATION_LISTENER_SERVICE.
+        -->
+        <service
+            android:name=".services.ExternalPlaybackNotificationListenerService"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/external_player_tracking"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
         <provider
             android:name="androidx.core.content.FileProvider"

@@ -83,6 +83,13 @@ abstract class OpenInAppAction(
 
     override val isPlayer = true
 
+    /**
+     * Whether this action runs a player on this device. Actions that cast to a
+     * remote device must override this to false because the remote device cannot
+     * reach the phone's loopback relay.
+     */
+    open val supportsLocalStreamProxy: Boolean = true
+
     override fun shouldShow(context: Context?, video: ResultEpisode?) =
         context?.isAppInstalled(packageName) != false
 
@@ -93,14 +100,27 @@ abstract class OpenInAppAction(
         index: Int?
     ) {
         if (context == null) return
+        val prepared = if (supportsLocalStreamProxy) {
+            ExternalPlaybackSupport.prepare(context, video, result, index)
+        } else {
+            ExternalPlaybackSupport.PreparedPlayback(result, index)
+        }
+
         val intent = Intent(action)
         intent.setPackage(packageName)
         if (intentClass != null) {
             intent.component = ComponentName(packageName, intentClass)
         }
-        putExtra(context, intent, video, result, index)
-        setKey("last_opened", video)
-        launchResult(intent)
+        try {
+            putExtra(context, intent, video, prepared.result, prepared.index)
+            setKey("last_opened", video)
+            launchResult(intent)
+        } catch (t: Throwable) {
+            if (prepared.isProxied) {
+                ExternalPlaybackSupport.stopActivePlayback(context)
+            }
+            throw t
+        }
     }
 
     /**
@@ -124,12 +144,25 @@ abstract class OpenInAppAction(
     @Throws
     abstract fun onResult(activity: Activity, intent: Intent?)
 
+    /**
+     * Called for every Activity Result, including RESULT_CANCELED. Most
+     * external players only expose data through [onResult], which the app calls
+     * for RESULT_OK. Actions that monitor the player independently can use this
+     * to release tracking state even when the player returns no data.
+     */
+    open fun onExternalPlaybackReturned(resultCode: Int, intent: Intent?) {
+    }
+
     /** Safe version of onResult, we don't trust extension devs to not crash the app */
     fun onResultSafe(activity: Activity, intent: Intent?) {
         try {
             onResult(activity, intent)
         } catch (t: Throwable) {
             logError(t)
+        } finally {
+            // The external player has returned control; release any relayed
+            // playback regardless of whether the player reported a position.
+            ExternalPlaybackSupport.stopActivePlayback(activity)
         }
     }
 }

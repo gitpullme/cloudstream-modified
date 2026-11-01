@@ -21,6 +21,7 @@ fun PreferenceScaffold(
     itemsProvider: @Composable () -> List<Preference>,
 ) {
     val (top, bottom) = remember { FocusRequester.createRefs() }
+    val items = itemsProvider()
 
     Scaffold(
         // TODO @WindowInsets remove this when we have converted everything to compose
@@ -33,7 +34,7 @@ fun PreferenceScaffold(
                 title = title,
                 navigateUp = onBackPressed,
                 actions = actions,
-                scrollBehavior = it,
+                scrollBehavior = null,
             )
         },
         content = { contentPadding ->
@@ -41,7 +42,7 @@ fun PreferenceScaffold(
                 modifier = Modifier.focusRequester(bottom).focusProperties {
                     up = top
                 },
-                items = itemsProvider(),
+                items = items,
                 contentPadding = contentPadding,
             )
         },

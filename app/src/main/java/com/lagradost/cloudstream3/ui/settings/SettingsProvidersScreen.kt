@@ -1,6 +1,8 @@
 package com.lagradost.cloudstream3.ui.settings
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import com.lagradost.cloudstream3.APIHolder
@@ -47,28 +49,36 @@ object SettingsProvidersScreen : SearchableSettings {
     override fun getPreferences(): List<Preference> {
         val settings = rememberAppSettings()
 
-        val default = AllLanguagesName to stringResource(R.string.all_languages_preference)
-        val languages = APIHolder.apis.withLock {
-            APIHolder.apis.map { api -> api.lang }.distinct()
-        }.sortedBy { fromTagToLanguageName(it) ?: it }
+        val context = LocalContext.current
+        val defaultName = stringResource(R.string.all_languages_preference)
+        val default = remember(defaultName) { AllLanguagesName to defaultName }
+        val languages = remember {
+            APIHolder.apis.withLock {
+                APIHolder.apis.map { api -> api.lang }.distinct()
+            }.sortedBy { fromTagToLanguageName(it) ?: it }
+        }
+        val providerEntries = remember(languages, default) {
+            mapOf(default) + languages.associateWith { lang ->
+                (getNameNextToFlagEmoji(lang) ?: lang)
+            }
+        }
+        val preferredMediaEntries = remember(context) {
+            TvType.entries.associate {
+                it.ordinal.toString() to context.getString(it.toStringRes())
+            }
+        }
 
         return persistentListOf(
             Preference.PreferenceItem.MultiSelectListPreference(
             title = stringResource(R.string.provider_lang_settings),
             icon = painterResource(R.drawable.plugin_lang),
-            entries = mapOf(default) + languages.associateWith { lang ->
-                (getNameNextToFlagEmoji(
-                    lang
-                ) ?: lang)
-            },
+            entries = providerEntries,
             preference = settings.provider.extensionLanguages
         ), Preference.PreferenceItem.MultiSelectListPreference(
             title = stringResource(R.string.preferred_media_settings),
             icon = painterResource(R.drawable.movie_edit_24px),
             preference = settings.provider.preferredMedia,
-            entries = TvType.entries.associate {
-                    it.ordinal.toString() to stringResource(it.toStringRes())
-                }),
+            entries = preferredMediaEntries),
             Preference.PreferenceItem.MultiSelectListPreference(
             title = stringResource(R.string.display_subbed_dubbed_settings),
             icon = painterResource(R.drawable.audio_capture_24px),

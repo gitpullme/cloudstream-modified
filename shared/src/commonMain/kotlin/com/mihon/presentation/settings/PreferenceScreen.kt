@@ -1,14 +1,14 @@
 package com.mihon.presentation.settings
 
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastForEachIndexed
@@ -28,6 +28,7 @@ fun PreferenceScreen(
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     val state = rememberLazyListState()
+    val scope = rememberCoroutineScope()
     val highlightKey = SearchableSettings.highlightKey
     if (highlightKey != null) {
         LaunchedEffect(Unit) {
@@ -51,18 +52,27 @@ fun PreferenceScreen(
                 is Preference.PreferenceGroup -> {
                     if (!preference.enabled) return@fastForEachIndexed
 
-                    item {
-                        Column {
-                            PreferenceGroupHeader(title = preference.title)
-                        }
+                    item(
+                        key = "group_header:$i:${preference.title}",
+                        contentType = "group_header",
+                    ) {
+                        PreferenceGroupHeader(title = preference.title)
                     }
-                    items(preference.preferenceItems) { item ->
+                    itemsIndexed(
+                        items = preference.preferenceItems,
+                        key = { innerIndex, item -> "group_item:$i:$innerIndex:${item.title}" },
+                        contentType = { _, item -> item.contentType },
+                    ) { _, item ->
                         PreferenceItem(
                             item = item,
                             highlightKey = highlightKey,
+                            scope = scope,
                         )
                     }
-                    item {
+                    item(
+                        key = "group_spacer:$i",
+                        contentType = "group_spacer",
+                    ) {
                         if (i < items.lastIndex) {
                             Spacer(modifier = Modifier.height(12.dp))
                         }
@@ -70,10 +80,14 @@ fun PreferenceScreen(
                 }
 
                 // Create Preference Item
-                is Preference.PreferenceItem<*, *> -> item {
+                is Preference.PreferenceItem<*, *> -> item(
+                    key = "item:$i:${preference.title}",
+                    contentType = preference.contentType,
+                ) {
                     PreferenceItem(
                         item = preference,
                         highlightKey = highlightKey,
+                        scope = scope,
                     )
                 }
             }

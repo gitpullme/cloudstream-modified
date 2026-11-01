@@ -48,12 +48,21 @@ fun BasePreferenceWidget(
 ) {
     val highlighted = LocalPreferenceHighlighted.current
     val minHeight = LocalPreferenceMinHeight.current
+    val clickModifier = when {
+        onClick != null && onLongClick != null -> Modifier.combinedClickable(
+            onLongClick = onLongClick,
+            onClick = onClick
+        )
+        onClick != null -> Modifier.clickable(onClick = onClick)
+        else -> Modifier
+    }
+
     Row(
         modifier = modifier
             .highlightBackground(highlighted)
             .focusOutline()
             .sizeIn(minHeight = minHeight)
-            .combinedClickable(enabled = onClick != null, onLongClick = onLongClick, onClick = { onClick?.invoke() })
+            .then(clickModifier)
             .fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -91,15 +100,12 @@ fun BasePreferenceWidget(
 
 @Composable
 internal fun Modifier.highlightBackground(highlighted: Boolean): Modifier {
-    var highlightFlag by remember { mutableStateOf(false) }
-    LaunchedEffect(highlighted) {
-        if (highlighted) {
-            highlightFlag = true
-            delay(3.seconds)
-            highlightFlag = false
-        } else {
-            highlightFlag = false
-        }
+    if (!highlighted) return this
+
+    var highlightFlag by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        delay(3.seconds)
+        highlightFlag = false
     }
     val highlight by animateColorAsState(
         targetValue = if (highlightFlag) {

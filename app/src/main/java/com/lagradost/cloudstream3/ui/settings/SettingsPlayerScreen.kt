@@ -1,14 +1,26 @@
 package com.lagradost.cloudstream3.ui.settings
 
+import android.content.Intent
+import android.provider.Settings
 import android.text.format.Formatter.formatShortFileSize
+import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.core.app.NotificationManagerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.res.integerArrayResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringArrayResource
@@ -16,6 +28,8 @@ import androidx.compose.ui.res.stringResource
 import com.lagradost.cloudstream3.CommonActivity.activity
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
+import com.lagradost.cloudstream3.ui.player.buffering.AggressiveBufferSettings
+import com.lagradost.cloudstream3.ui.player.buffering.SmartPrefetchEngine
 import com.lagradost.cloudstream3.ui.player.source_priority.QualityProfileDialog
 import com.lagradost.cloudstream3.ui.settings.SettingsFragment.Companion.getFolderSize
 import com.lagradost.cloudstream3.ui.subtitles.ChromecastSubtitlesFragment
@@ -23,12 +37,16 @@ import com.lagradost.cloudstream3.ui.subtitles.SubtitlesFragment
 import com.lagradost.cloudstream3.utils.Coroutines.ioSafe
 import com.lagradost.cloudstream4.compose.EMULATOR
 import com.lagradost.cloudstream4.compose.PHONE
+import com.lagradost.cloudstream4.compose.SingleSelectDialog
 import com.lagradost.cloudstream4.compose.TV
 import com.lagradost.cloudstream4.compose.isLayout
 import com.lagradost.cloudstream4.rememberAppSettings
 import com.mihon.presentation.settings.Preference
 import com.mihon.presentation.settings.SearchableSettings
+import com.mihon.presentation.settings.collectAsState
+import com.mihon.presentation.settings.widget.TextPreferenceWidget
 import kotlinx.collections.immutable.persistentListOf
+import kotlinx.collections.immutable.toPersistentList
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.reflect.jvm.jvmName
@@ -38,6 +56,7 @@ object SettingsPlayerScreen : SearchableSettings {
     override fun getTitleRes(): String = stringResource(R.string.category_player)
 
     @Composable
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     override fun getPreferences(): List<Preference> {
         val settings = rememberAppSettings()
 
@@ -49,6 +68,90 @@ object SettingsPlayerScreen : SearchableSettings {
                     player.uniqueId() to (player.name.asStringNull(context)
                         ?: player::class.simpleName ?: player::class.jvmName)
                 }
+        }
+
+        val externalTrackingEnabled by settings.player.externalPlayerTrackingEnabled.collectAsState()
+        var notificationAccessGranted by remember(context) {
+            mutableStateOf(
+                NotificationManagerCompat.getEnabledListenerPackages(context)
+                    .contains(context.packageName)
+            )
+        }
+        val lifecycleOwner = LocalLifecycleOwner.current
+        DisposableEffect(lifecycleOwner, context) {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    notificationAccessGranted =
+                        NotificationManagerCompat.getEnabledListenerPackages(context)
+                            .contains(context.packageName)
+                }
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        }
+
+        val aggressiveEnabled by settings.player.aggressiveBufferEnabled.collectAsState()
+        val aggressiveMinutes by settings.player.aggressiveBufferMinutes.collectAsState()
+        val sanitizedAggressiveMinutes =
+            AggressiveBufferSettings.sanitizeMinutes(aggressiveMinutes)
+        LaunchedEffect(aggressiveMinutes) {
+            if (aggressiveMinutes < AggressiveBufferSettings.MIN_MINUTES ||
+                aggressiveMinutes > AggressiveBufferSettings.MAX_MINUTES
+            ) {
+                settings.player.aggressiveBufferMinutes.set(sanitizedAggressiveMinutes)
+            }
+        }
+        var showAggressiveDurationDialog by remember { mutableStateOf(false) }
+        val durationLabels = remember(context) {
+            (AggressiveBufferSettings.MIN_MINUTES..AggressiveBufferSettings.MAX_MINUTES)
+                .associateWith { minutes ->
+                    context.resources.getQuantityString(
+                        R.plurals.aggressive_forward_buffer_minutes,
+                        minutes,
+                        minutes
+                    )
+                }
+        }
+
+        val softwareDecodingEntries = remember(context) {
+            context.resources.getIntArray(R.array.software_decoding_switch_values).toTypedArray().zip(
+                context.resources.getStringArray(R.array.software_decoding_switch)
+            ).toMap()
+        }
+
+        val limitTitleEntries = remember(context) {
+            context.resources.getIntArray(R.array.limit_title_pref_values).toTypedArray().zip(
+                context.resources.getStringArray(R.array.limit_title_pref_names)
+            ).toMap()
+        }
+
+        val bufferSizeEntries = remember(context) {
+            context.resources.getIntArray(R.array.video_buffer_size_values).toTypedArray().zip(
+                context.resources.getStringArray(R.array.video_buffer_size_names)
+            ).toMap()
+        }
+
+        val bufferLengthEntries = remember(context) {
+            context.resources.getIntArray(R.array.video_buffer_length_values).toTypedArray().zip(
+                context.resources.getStringArray(R.array.video_buffer_length_names)
+            ).toMap()
+        }
+        if (showAggressiveDurationDialog) {
+            SingleSelectDialog(
+                title = stringResource(R.string.aggressive_forward_buffer),
+                entries = durationLabels,
+                selectedKey = sanitizedAggressiveMinutes,
+                confirmText = stringResource(R.string.ok),
+                dismissText = stringResource(R.string.cancel),
+                dismiss = { showAggressiveDurationDialog = false },
+                confirm = { minutes ->
+                    if (AggressiveBufferSettings.canEnableWithSelection(minutes)) {
+                        settings.player.aggressiveBufferMinutes.set(minutes)
+                        settings.player.aggressiveBufferEnabled.set(true)
+                    }
+                    showAggressiveDurationDialog = false
+                },
+            )
         }
 
         var cacheSize by remember { mutableLongStateOf(0L) }
@@ -78,6 +181,44 @@ object SettingsPlayerScreen : SearchableSettings {
                         onClick = {
                             ChromecastSubtitlesFragment.push(activity, false)
                         }),
+                ),
+            ),
+            Preference.PreferenceGroup(
+                title = stringResource(R.string.external_player_tracking_category),
+                preferenceItems = persistentListOf(
+                    Preference.PreferenceItem.SwitchPreference(
+                        preference = settings.player.externalPlayerTrackingEnabled,
+                        title = stringResource(R.string.external_player_tracking),
+                        subtitle = stringResource(R.string.external_player_tracking_description),
+                        icon = painterResource(R.drawable.history_toggle_off_24px),
+                    ),
+                    Preference.PreferenceItem.TextPreference(
+                        title = stringResource(R.string.external_player_notification_access),
+                        subtitle = when {
+                            !externalTrackingEnabled ->
+                                stringResource(R.string.external_player_notification_access_disabled)
+
+                            notificationAccessGranted ->
+                                stringResource(R.string.external_player_notification_access_granted)
+
+                            else ->
+                                stringResource(R.string.external_player_notification_access_denied)
+                        },
+                        icon = painterResource(R.drawable.notifications_active_24px),
+                        onClick = {
+                            val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                            try {
+                                context.startActivity(intent)
+                            } catch (_: Throwable) {
+                                try {
+                                    context.startActivity(Intent(Settings.ACTION_SETTINGS))
+                                } catch (_: Throwable) {
+                                    // Nothing else we can do; the system settings
+                                    // app may be unavailable on this device.
+                                }
+                            }
+                        },
+                    ),
                 ),
             ),
             Preference.PreferenceGroup(
@@ -184,9 +325,7 @@ object SettingsPlayerScreen : SearchableSettings {
                         title = stringResource(R.string.software_decoding),
                         subtitle = stringResource(R.string.software_decoding_desc),
                         icon = painterResource(R.drawable.memory_24px),
-                        entries = integerArrayResource(R.array.software_decoding_switch_values).zip(
-                            stringArrayResource(R.array.software_decoding_switch)
-                        ).toMap()
+                        entries = softwareDecodingEntries
                     ),
                     Preference.PreferenceItem.SwitchPreference(
                         preference = settings.player.extraBrightnessEnabled,
@@ -268,9 +407,7 @@ object SettingsPlayerScreen : SearchableSettings {
                         preference = settings.player.limitPlayerTitle,
                         title = stringResource(R.string.limit_title),
                         icon = painterResource(R.drawable.match_word_24px),
-                        entries = integerArrayResource(R.array.limit_title_pref_values).zip(
-                            stringArrayResource(R.array.limit_title_pref_names)
-                        ).toMap()
+                        entries = limitTitleEntries
                     ),
                     Preference.PreferenceItem.SwitchPreference(
                         enabled = isLayout(PHONE or EMULATOR),
@@ -309,50 +446,141 @@ object SettingsPlayerScreen : SearchableSettings {
             ),
             Preference.PreferenceGroup(
                 title = stringResource(R.string.pref_category_cache),
-                preferenceItems = persistentListOf(
-                    Preference.PreferenceItem.ListPreference(
-                        preference = settings.player.bufferDiskMB,
-                        title = stringResource(R.string.video_buffer_disk_settings),
-                        subtitle = "%s\n" + stringResource(R.string.video_disk_description),
-                        icon = painterResource(R.drawable.hard_drive_24px),
-                        entries = integerArrayResource(R.array.video_buffer_size_values).zip(
-                            stringArrayResource(R.array.video_buffer_size_names)
-                        ).toMap()
-                    ),
+                preferenceItems = buildList<Preference.PreferenceItem<*, *>> {
+                    val inactiveSummary =
+                        stringResource(R.string.aggressive_forward_buffer_legacy_disabled)
+                    if (aggressiveEnabled) {
+                        add(
+                            disabledCacheItem(
+                                title = stringResource(R.string.video_buffer_disk_settings),
+                                subtitle = stringResource(R.string.video_disk_description) +
+                                        "\n" + inactiveSummary,
+                                icon = painterResource(R.drawable.hard_drive_24px),
+                            )
+                        )
+                        add(
+                            disabledCacheItem(
+                                title = stringResource(R.string.video_buffer_size_settings),
+                                subtitle = stringResource(R.string.video_ram_description) +
+                                        "\n" + inactiveSummary,
+                                icon = painterResource(R.drawable.memory_alt_24px),
+                            )
+                        )
+                        add(
+                            disabledCacheItem(
+                                title = stringResource(R.string.video_buffer_length_settings),
+                                subtitle = stringResource(R.string.video_ram_description) +
+                                        "\n" + inactiveSummary,
+                                icon = painterResource(R.drawable.history_toggle_off_24px),
+                            )
+                        )
+                    } else {
+                        add(
+                            Preference.PreferenceItem.ListPreference(
+                                preference = settings.player.bufferDiskMB,
+                                title = stringResource(R.string.video_buffer_disk_settings),
+                                subtitle = "%s\n" + stringResource(R.string.video_disk_description),
+                                icon = painterResource(R.drawable.hard_drive_24px),
+                                entries = bufferSizeEntries
+                            )
+                        )
+                        add(
+                            Preference.PreferenceItem.ListPreference(
+                                preference = settings.player.bufferRamMB,
+                                title = stringResource(R.string.video_buffer_size_settings),
+                                subtitle = "%s\n" + stringResource(R.string.video_ram_description),
+                                icon = painterResource(R.drawable.memory_alt_24px),
+                                entries = bufferSizeEntries
+                            )
+                        )
+                        add(
+                            Preference.PreferenceItem.ListPreference(
+                                preference = settings.player.bufferTimeSec,
+                                title = stringResource(R.string.video_buffer_length_settings),
+                                subtitle = "%s\n" + stringResource(R.string.video_ram_description),
+                                icon = painterResource(R.drawable.history_toggle_off_24px),
+                                entries = bufferLengthEntries
+                            )
+                        )
+                    }
 
-                    Preference.PreferenceItem.ListPreference(
-                        preference = settings.player.bufferRamMB,
-                        title = stringResource(R.string.video_buffer_size_settings),
-                        subtitle = "%s\n" + stringResource(R.string.video_ram_description),
-                        icon = painterResource(R.drawable.memory_alt_24px),
-                        entries = integerArrayResource(R.array.video_buffer_size_values).zip(
-                            stringArrayResource(R.array.video_buffer_size_names)
-                        ).toMap()
-                    ),
+                    add(
+                        Preference.PreferenceItem.TextPreference(
+                            icon = painterResource(R.drawable.ic_baseline_delete_outline_24),
+                            title = stringResource(R.string.video_buffer_clear_settings),
+                            subtitle = formatShortFileSize(LocalContext.current, cacheSize),
+                            onClick = {
+                                ioSafe {
+                                    cacheDir.deleteRecursively()
+                                    cacheCleared += 1
+                                }
+                            })
+                    )
 
-                    Preference.PreferenceItem.ListPreference(
-                        preference = settings.player.bufferTimeSec,
-                        title = stringResource(R.string.video_buffer_length_settings),
-                        subtitle = "%s\n" + stringResource(R.string.video_ram_description),
-                        icon = painterResource(R.drawable.history_toggle_off_24px),
-                        entries = integerArrayResource(R.array.video_buffer_length_values).zip(
-                            stringArrayResource(R.array.video_buffer_length_names)
-                        ).toMap()
-                    ),
+                    if (aggressiveEnabled) {
+                        add(
+                            Preference.PreferenceItem.ListPreference(
+                                preference = settings.player.aggressiveBufferMinutes,
+                                title = stringResource(R.string.aggressive_forward_buffer_duration),
+                                subtitle = "%s",
+                                icon = painterResource(R.drawable.history_toggle_off_24px),
+                                entries = durationLabels,
+                            )
+                        )
+                    }
 
-                    Preference.PreferenceItem.TextPreference(
-                        icon = painterResource(R.drawable.ic_baseline_delete_outline_24),
-                        title = stringResource(R.string.video_buffer_clear_settings),
-                        subtitle = formatShortFileSize(LocalContext.current, cacheSize),
-                        onClick = {
-                            ioSafe {
-                                cacheDir.deleteRecursively()
-                                cacheCleared += 1
-                            }
-                        })
-                )
+                    add(
+                        Preference.PreferenceItem.SwitchPreference(
+                            preference = settings.player.aggressiveBufferEnabled,
+                            title = stringResource(R.string.aggressive_forward_buffer),
+                            subtitle = stringResource(
+                                R.string.aggressive_forward_buffer_description
+                            ) + if (aggressiveEnabled) {
+                                "\n" + durationLabels[sanitizedAggressiveMinutes]
+                            } else {
+                                ""
+                            },
+                            icon = painterResource(R.drawable.hard_drive_24px),
+                            onValueChanged = { enabled ->
+                                if (!enabled) {
+                                    SmartPrefetchEngine.cancelAllActive()
+                                    true
+                                } else if (!AggressiveBufferSettings.shouldPromptForDuration(
+                                        minutesWereStored =
+                                            settings.player.aggressiveBufferMinutes.isSet(),
+                                        minutes = aggressiveMinutes,
+                                    )
+                                ) {
+                                    true
+                                } else {
+                                    showAggressiveDurationDialog = true
+                                    false
+                                }
+                            },
+                        )
+                    )
+
+                }.toPersistentList()
             ),
 
             )
+    }
+}
+
+@Composable
+private fun disabledCacheItem(
+    title: String,
+    subtitle: String,
+    icon: Painter,
+): Preference.PreferenceItem.CustomPreference {
+    return Preference.PreferenceItem.CustomPreference(title = title) {
+        Box(modifier = Modifier.alpha(0.45f)) {
+            TextPreferenceWidget(
+                title = title,
+                subtitle = subtitle,
+                icon = icon,
+                onPreferenceClick = null,
+            )
+        }
     }
 }

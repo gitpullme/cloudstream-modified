@@ -32,14 +32,12 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 // import androidx.media3.common.util.ExperimentalApi
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
-import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.cronet.CronetDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DecoderCounters
@@ -80,7 +78,6 @@ import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.setKey
 import com.lagradost.cloudstream3.CommonActivity.activity
 import com.lagradost.cloudstream3.ErrorLoadingException
-import com.lagradost.cloudstream3.MainActivity.Companion.deleteFileOnExit
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.USER_AGENT
@@ -89,6 +86,19 @@ import com.lagradost.cloudstream3.mvvm.debugAssert
 import com.lagradost.cloudstream3.mvvm.logError
 import com.lagradost.cloudstream3.mvvm.safe
 import com.lagradost.cloudstream3.ui.player.CustomDecoder.Companion.fixSubtitleAlignment
+import com.lagradost.cloudstream3.ui.player.buffering.AggressiveBufferController
+import com.lagradost.cloudstream3.ui.player.buffering.AggressiveBufferDiagnostics
+import com.lagradost.cloudstream3.ui.player.buffering.AggressiveBufferDiagnosticsSnapshot
+import com.lagradost.cloudstream3.ui.player.buffering.AggressiveLoadControl
+import com.lagradost.cloudstream3.ui.player.buffering.BufferingPolicyResolver
+import com.lagradost.cloudstream3.ui.player.buffering.ChunkedCacheDataSourceFactory
+import com.lagradost.cloudstream3.ui.player.buffering.PlayerBufferingPolicy
+import com.lagradost.cloudstream3.ui.player.buffering.PlayerCacheManager
+import com.lagradost.cloudstream3.ui.player.buffering.PlayerCacheSelection
+import com.lagradost.cloudstream3.ui.player.buffering.PrefetchRuntimeSnapshot
+import com.lagradost.cloudstream3.ui.player.buffering.PrefetchStatus
+import com.lagradost.cloudstream3.ui.player.buffering.PrefetchSupport
+import com.lagradost.cloudstream3.ui.player.buffering.SmartPrefetchEngine
 import com.lagradost.cloudstream3.ui.player.live.LiveHelper
 import com.lagradost.cloudstream3.ui.player.live.PREFERRED_LIVE_OFFSET
 import com.lagradost.cloudstream3.ui.settings.Globals.EMULATOR
@@ -111,7 +121,12 @@ import com.lagradost.cloudstream3.utils.SubtitleHelper.fromTagToLanguageName
 import com.lagradost.cloudstream3.utils.WIDEVINE_DRM_UUID
 import com.lagradost.cloudstream3.utils.videoskip.VideoSkipStamp
 import com.lagradost.cloudstream4.AppSettings
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import okhttp3.Interceptor
 import org.chromium.net.CronetEngine
 import java.io.File
@@ -149,9 +164,14 @@ class CS3IPlayer : IPlayer {
             field = value
         }
 
-    var cacheSize = 0L
-    var simpleCacheSize = 0L
-    var videoBufferMs = 0L
+    var bufferingPolicy: PlayerBufferingPolicy =
+        PlayerBufferingPolicy.Legacy(0L, 0L, 0L)
+
+    private var aggressiveLoadControl: AggressiveLoadControl? = null
+    private var aggressiveMonitorJob: Job? = null
+    private var activeCacheDirectory: String? = null
+    private var activeCache: Cache? = null
+    private var smartPrefetchEngine: SmartPrefetchEngine? = null
 
     val imageGenerator = IPreviewGenerator.new()
 
@@ -291,6 +311,7 @@ class CS3IPlayer : IPlayer {
         preview: Boolean,
     ) {
         Log.i(TAG, "loadPlayer")
+        bufferingPolicy = BufferingPolicyResolver.resolve(context)
         if (sameEpisode) {
             saveData()
         } else {
@@ -599,9 +620,225 @@ class CS3IPlayer : IPlayer {
         }
     }
 
+    private fun startAggressiveMonitor(loadControl: AggressiveLoadControl) {
+        aggressiveMonitorJob?.cancel()
+        val policy = loadControl.controller.policy
+        aggressiveMonitorJob = CoroutineScope(Dispatchers.Main.immediate).launch {
+            while (isActive) {
+                val exo = exoPlayer ?: break
+                try {
+                    val current = exo.currentPosition
+                    val buffered = exo.bufferedPosition
+                    val forward = AggressiveBufferController.forwardBufferedMs(current, buffered)
+                    val prefetchSupport = smartPrefetchEngine?.runtimeSnapshot?.support
+                    val isLiveFromExo = exo.isCurrentMediaItemLive
+                    val isVod = !isLiveFromExo && (prefetchSupport == PrefetchSupport.HLS_VOD ||
+                            prefetchSupport == PrefetchSupport.DASH_VOD ||
+                            prefetchSupport == PrefetchSupport.PROGRESSIVE_VOD ||
+                            (exo.duration != TIME_UNSET && exo.duration > 0L))
+
+                    loadControl.isVodOverride = isVod
+                    val isLive = isLiveFromExo
+                    val remaining = exo.duration
+                        .takeIf { it != TIME_UNSET && it >= 0L }
+                        ?.minus(current)
+                        ?.coerceAtLeast(0L)
+                    val target = loadControl.controller.effectiveTarget(
+                        playWhenReady = exo.playWhenReady,
+                        isLive = isLive,
+                        remainingMediaMs = remaining,
+                    )
+                    val allocated = loadControl.allocatedBytes
+                    val memoryLimited = loadControl.controller.isMemoryLimited(allocated)
+                    val storageLimited = policy.cacheStorageLimited
+                    // A partial quota is still usable. Only a missing cache should stop
+                    // prefetching entirely; the 85% quota guard below bounds the rest.
+                    val storageUnavailable = policy.cacheQuotaBytes <= 0L ||
+                            activeCacheDirectory == null
+                    smartPrefetchEngine?.updatePlayerState(
+                        currentMs = current,
+                        bufferedMs = buffered,
+                        playWhenReady = exo.playWhenReady,
+                        isLive = isLive,
+                        memoryLimited = memoryLimited,
+                        storageLimited = storageUnavailable,
+                        // Used by the prefetch engine to yield bandwidth while the player
+                        // is actively reading. It does not stop useful far-ahead work
+                        // unless the playable buffer is also critically low.
+                        isPlayerLoading = exo.isLoading,
+                        durationMs = exo.duration.takeIf { it != TIME_UNSET && it >= 0L },
+                        selectedFormat = selectedVideoFormat(),
+                    )
+                    val prefetch = smartPrefetchEngine?.runtimeSnapshot
+                        ?: unsupportedPrefetchSnapshot(storageUnavailable)
+                    AggressiveBufferDiagnostics.update(
+                        AggressiveBufferDiagnosticsSnapshot(
+                            targetMinutes = policy.targetMinutes,
+                            targetMs = policy.targetForwardMs,
+                            effectiveTargetMs = target.targetMs,
+                            currentPositionMs = current,
+                            bufferedPositionMs = buffered,
+                            forwardBufferedMs = forward,
+                            allocatedBytes = allocated,
+                            memoryBudgetBytes = policy.memoryBudgetBytes,
+                            bitrateEstimateBps = loadControl.controller.bitrateEstimateBps,
+                            cacheSpaceBytes = activeCacheDirectory
+                                ?.let { PlayerCacheManager.cacheSpace(it) } ?: 0L,
+                            cacheQuotaBytes = activeCacheDirectory
+                                ?.let { PlayerCacheManager.currentQuota(it) }
+                                ?: policy.cacheQuotaBytes,
+                            availableStorageBytes = policy.availableStorageBytes,
+                            isLive = isLive,
+                            isPlaying = exo.isPlaying,
+                            playWhenReady = exo.playWhenReady,
+                            isLoading = exo.isLoading,
+                            targetReasons = target.reasons,
+                            memoryLimited = memoryLimited,
+                            storageLimited = storageLimited || storageUnavailable,
+                            sourceLimited = prefetch.support == null ||
+                                    prefetch.status == PrefetchStatus.SOURCE_UNAVAILABLE ||
+                                    prefetch.status == PrefetchStatus.AUTH_OR_URL_FAILURE,
+                            sourceType = currentLink?.type?.name ?: "unknown",
+                            prefetchStatus = prefetch.status,
+                            prefetchSupport = prefetch.support,
+                            activePrefetchRequests = prefetch.activeRequests,
+                            maxParallelRequests = prefetch.maxParallelRequests,
+                            completedPrefetchTasks = prefetch.completedTasks,
+                            pendingPrefetchTasks = prefetch.pendingTasks,
+                            prefetchedCachedAheadMs = prefetch.cachedAheadMs,
+                            prefetchedBytes = prefetch.prefetchedBytes,
+                            prefetchBytesPerSecond = prefetch.prefetchBytesPerSecond,
+                            lastPrefetchFailure = prefetch.lastFailure,
+                        )
+                    )
+                } catch (e: Exception) {
+                    logError(e)
+                }
+                delay(500L)
+            }
+        }
+    }
+
+    private fun shouldChunkProgressiveCache(mediaItemSlices: List<MediaItemSlice>): Boolean {
+        if (mediaItemSlices.size != 1) return false
+        if (mediaItemSlices.any { it.drm != null }) return false
+        val link = currentLink ?: return false
+        if (link is ExtractorLinkPlayList || link is DrmExtractorLink) return false
+        if (link.type != ExtractorLinkType.VIDEO) return false
+        val url = link.url
+        return !url.contains(".m3u8", ignoreCase = true) &&
+                !url.contains(".mpd", ignoreCase = true)
+    }
+
+    private fun startSmartPrefetch(
+        onlineSource: HttpDataSource.Factory?,
+        cache: Cache?,
+        policy: PlayerBufferingPolicy,
+        chunkedProgressive: Boolean,
+    ) {
+        smartPrefetchEngine?.release()
+        smartPrefetchEngine = null
+        if (policy !is PlayerBufferingPolicy.Aggressive ||
+            onlineSource == null ||
+            cache == null
+        ) return
+        val link = currentLink ?: return
+        // A playlist wrapper can resolve to a different media item than currentLink.url;
+        // speculative work must never target the wrong presentation. DRM playback keeps
+        // its native connection/session path and is left out of speculative fetching.
+        if (link is ExtractorLinkPlayList || link is DrmExtractorLink) return
+        val uri = runCatching { android.net.Uri.parse(link.url) }.getOrNull() ?: return
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") return
+        // Torrent playback and other local proxies are not speculative media; their
+        // own server owns the connection budget and local disk.
+        val host = uri.host?.lowercase()
+        if (host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]") return
+        val effectiveType = when {
+            link.type == ExtractorLinkType.M3U8 -> ExtractorLinkType.M3U8
+            link.type == ExtractorLinkType.DASH -> ExtractorLinkType.DASH
+            link.url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
+            link.url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
+            else -> link.type
+        }
+        // Direct files are prefetched as validated sequential byte ranges. Without the
+        // bounded player chunks, the player holds one open cache hole to EOF and a
+        // speculative writer would block on it forever. Playlist wrappers are excluded
+        // above because their resolved media item may differ.
+        if (effectiveType == ExtractorLinkType.VIDEO && !chunkedProgressive) return
+        if (effectiveType != ExtractorLinkType.M3U8 &&
+            effectiveType != ExtractorLinkType.DASH &&
+            effectiveType != ExtractorLinkType.VIDEO
+        ) return
+        smartPrefetchEngine = SmartPrefetchEngine(
+            cache = cache,
+            upstreamFactory = onlineSource,
+            sourceUri = uri,
+            sourceType = effectiveType,
+            targetMs = policy.targetForwardMs,
+            maxParallelRequests = policy.maxParallelRequests,
+        ).also { it.start() }
+    }
+
+    private fun selectedVideoFormat(): Format? {
+        exoPlayer?.videoFormat?.let { return it }
+        val groups = exoPlayer?.currentTracks?.groups ?: return null
+        val videoGroup = groups.firstOrNull { it.type == TRACK_TYPE_VIDEO && it.isSelected }
+            ?: groups.firstOrNull { it.type == TRACK_TYPE_VIDEO }
+            ?: return null
+        for (i in 0 until videoGroup.length) {
+            if (videoGroup.isTrackSelected(i)) {
+                return videoGroup.getTrackFormat(i)
+            }
+        }
+        // No selected track yet. Do not guess a quality; wait for track selection so
+        // speculative work cannot target a representation the player is not using.
+        return null
+    }
+
+    private fun unsupportedPrefetchSnapshot(storageUnavailable: Boolean): PrefetchRuntimeSnapshot {
+        val link = currentLink
+        val url = link?.url.orEmpty()
+        val support = when {
+            link?.type == ExtractorLinkType.M3U8 || url.contains(".m3u8", ignoreCase = true) ->
+                PrefetchSupport.HLS_VOD
+            link?.type == ExtractorLinkType.DASH || url.contains(".mpd", ignoreCase = true) ->
+                PrefetchSupport.DASH_VOD
+            link != null -> PrefetchSupport.PROGRESSIVE_VOD
+            else -> null
+        }
+        val status = when {
+            storageUnavailable -> PrefetchStatus.STORAGE_PRESSURE
+            activeCacheDirectory == null -> PrefetchStatus.CACHE_READ_OR_WRITE_FAILURE
+            support == null || support == PrefetchSupport.PROGRESSIVE_VOD ->
+                PrefetchStatus.FORMAT_UNSUPPORTED_FOR_PREFETCH
+            else -> PrefetchStatus.IDLE
+        }
+        return PrefetchRuntimeSnapshot(
+            status = status,
+            support = support,
+            activeRequests = 0,
+            maxParallelRequests = (bufferingPolicy as? PlayerBufferingPolicy.Aggressive)
+                ?.maxParallelRequests ?: 0,
+            completedTasks = 0,
+            pendingTasks = 0,
+            cachedAheadMs = 0L,
+            prefetchedBytes = 0L,
+            lastFailure = null,
+        )
+    }
+
     private fun releasePlayer(saveTime: Boolean = true) {
         Log.i(TAG, "releasePlayer")
         eventLooperIndex += 1
+        aggressiveMonitorJob?.cancel()
+        aggressiveMonitorJob = null
+        smartPrefetchEngine?.release()
+        smartPrefetchEngine = null
+        activeCache = null
+        aggressiveLoadControl = null
+        activeCacheDirectory = null
+        AggressiveBufferDiagnostics.clear()
         if (saveTime)
             updatedTime()
 
@@ -670,6 +907,7 @@ class CS3IPlayer : IPlayer {
 
     companion object {
         private const val CRONET_TIMEOUT_MS = 15_000
+        private const val AGGRESSIVE_HTTP_CACHE_BYTES = 128L * 1024L * 1024L
 
         /**
          * Single shared engine, to minimize the overhead of maintaining many as:
@@ -742,8 +980,6 @@ class CS3IPlayer : IPlayer {
                 field = value
             }
 
-        private var simpleCache: SimpleCache? = null
-
         /// Create a small factory for small things, no cache, no cronet
         private fun createOnlineSource(
             headers: Map<String, String>?,
@@ -809,10 +1045,10 @@ class CS3IPlayer : IPlayer {
 
             val source = if (interceptor == null) {
                 if (engine == null) {
-                    Log.d(TAG, "Using DefaultHttpDataSource for $link")
+                    Log.d(TAG, "Using DefaultHttpDataSource for ${link.type}")
                     OkHttpDataSource.Factory(app.baseClient).setUserAgent(userAgent)
                 } else {
-                    Log.d(TAG, "Using CronetDataSource for $link")
+                    Log.d(TAG, "Using CronetDataSource for ${link.type}")
                     CronetDataSource.Factory(engine, Executors.newSingleThreadExecutor())
                         .setUserAgent(userAgent)
                         .setConnectionTimeoutMs(CRONET_TIMEOUT_MS)
@@ -821,7 +1057,7 @@ class CS3IPlayer : IPlayer {
                         .setHandleSetCookieRequests(true)
                 }
             } else {
-                Log.d(TAG, "Using OkHttpDataSource for $link")
+                Log.d(TAG, "Using OkHttpDataSource for ${link.type}")
                 val client = app.baseClient.newBuilder()
                     .addInterceptor(interceptor)
                     .build()
@@ -846,22 +1082,6 @@ class CS3IPlayer : IPlayer {
                 this,
                 DefaultHttpDataSource.Factory().setUserAgent(USER_AGENT)
             )
-        }
-
-        private fun getCache(context: Context, cacheSize: Long): SimpleCache? {
-            return try {
-                val databaseProvider = StandaloneDatabaseProvider(context)
-                SimpleCache(
-                    File(
-                        context.cacheDir, "exoplayer"
-                    ).also { deleteFileOnExit(it) }, // Ensures always fresh file
-                    LeastRecentlyUsedCacheEvictor(cacheSize),
-                    databaseProvider
-                )
-            } catch (e: Exception) {
-                logError(e)
-                null
-            }
         }
 
         private fun getMediaItemBuilder(mimeType: String):
@@ -1079,8 +1299,7 @@ class CS3IPlayer : IPlayer {
         playbackPosition: Long,
         playBackSpeed: Float,
         subtitleOffset: Long,
-        cacheSize: Long,
-        videoBufferMs: Long,
+        bufferingPolicy: PlayerBufferingPolicy,
         onlineSource: HttpDataSource.Factory? = null,
         playWhenReady: Boolean = true,
         trackSelector: TrackSelector? = null,
@@ -1092,6 +1311,43 @@ class CS3IPlayer : IPlayer {
         /** External audio tracks to merge with the video */
         audioSources: List<MediaSource> = emptyList()
     ): ExoPlayer {
+        aggressiveMonitorJob?.cancel()
+        aggressiveMonitorJob = null
+        smartPrefetchEngine?.release()
+        smartPrefetchEngine = null
+        activeCache = null
+        activeCacheDirectory = null
+        val legacyConfig = bufferingPolicy.legacyConfig()
+        val aggressivePolicy = (bufferingPolicy as? PlayerBufferingPolicy.Aggressive)
+            ?.takeIf { onlineSource != null }
+        aggressiveLoadControl = aggressivePolicy?.let {
+            AggressiveLoadControl(AggressiveBufferController(it))
+        }
+        val activeLoadControl = aggressiveLoadControl ?: DefaultLoadControl.Builder()
+            .setTargetBufferBytes(
+                if (legacyConfig.targetBufferBytes <= 0L) {
+                    DefaultLoadControl.DEFAULT_TARGET_BUFFER_BYTES
+                } else {
+                    if (legacyConfig.targetBufferBytes > Int.MAX_VALUE) {
+                        Int.MAX_VALUE
+                    } else {
+                        legacyConfig.targetBufferBytes.toInt()
+                    }
+                }
+            )
+            .setBackBuffer(30_000, true)
+            .setBufferDurationsMs(
+                DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                if (legacyConfig.maxBufferMs <= 0L) {
+                    DefaultLoadControl.DEFAULT_MAX_BUFFER_MS
+                } else {
+                    legacyConfig.maxBufferMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                },
+                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS
+            )
+            .build()
+
         val exoPlayerBuilder =
             ExoPlayer.Builder(context)
                 .setMediaSourceFactory(
@@ -1259,30 +1515,7 @@ class CS3IPlayer : IPlayer {
                 )
                 // Allows any seeking to be +- 0.3s to allow for faster seeking
                 .setSeekParameters(SeekParameters(toleranceBeforeUs, toleranceAfterUs))
-                .setLoadControl(
-                    DefaultLoadControl.Builder()
-                        .setTargetBufferBytes(
-                            if (cacheSize <= 0) {
-                                DefaultLoadControl.DEFAULT_TARGET_BUFFER_BYTES
-                            } else {
-                                if (cacheSize > Int.MAX_VALUE) Int.MAX_VALUE else cacheSize.toInt()
-                            }
-                        )
-                        .setBackBuffer(
-                            30000,
-                            true
-                        )
-                        .setBufferDurationsMs(
-                            DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                            if (videoBufferMs <= 0) {
-                                DefaultLoadControl.DEFAULT_MAX_BUFFER_MS
-                            } else {
-                                videoBufferMs.toInt()
-                            },
-                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS
-                        ).build()
-                )
+                .setLoadControl(activeLoadControl)
 
         // Because "Java rules" the media3 team hates to do open classes so we have to copy paste the entire thing to add a custom extractor
         // This includes the updated MKV extractor that enabled seeking in formats where the seek information is at the back of the file
@@ -1290,17 +1523,40 @@ class CS3IPlayer : IPlayer {
             .setFragmentedMp4ExtractorFlags(FragmentedMp4Extractor.FLAG_MERGE_FRAGMENTED_SIDX)
 
         // Create an online connection with cache for all online sources
+        var chunkedProgressive = false
         val dataSourceFactory = if (onlineSource == null) {
             null
         } else {
-            if (simpleCache == null)
-                simpleCache = getCache(context, simpleCacheSize)
+            val config = PlayerCacheSelection.forPolicy(bufferingPolicy, online = true)
+            val cache = config?.let { PlayerCacheManager.getCache(context, it) }
+            activeCache = cache
+            activeCacheDirectory = if (cache != null) config.directoryName else null
+            // Progressive media opens one open-ended cache span, which prevents a range
+            // prefetcher from writing ahead. Bound the player's cache requests only for
+            // eligible progressive links; HLS/DASH already use discrete segments.
+            chunkedProgressive = bufferingPolicy is PlayerBufferingPolicy.Aggressive &&
+                    cache != null &&
+                    shouldChunkProgressiveCache(mediaItemSlices)
 
-            val cacheFactory = CacheDataSource.Factory().apply {
-                simpleCache?.let { setCache(it) }
-                setUpstreamDataSourceFactory(onlineSource)
+            if (cache == null) {
+                // A storage-constrained device can resolve to no disk cache. CacheDataSource
+                // requires a cache instance, so play directly through the network factory
+                // instead of failing the media load.
+                onlineSource
+            } else {
+                val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+                    setCache(cache)
+                    setUpstreamDataSourceFactory(onlineSource)
+                    if (bufferingPolicy is PlayerBufferingPolicy.Aggressive) {
+                        setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+                    }
+                }
+                if (chunkedProgressive) {
+                    ChunkedCacheDataSourceFactory(cacheDataSourceFactory, cache)
+                } else {
+                    cacheDataSourceFactory
+                }
             }
-            cacheFactory
         }
 
         val defaultMediaSourceFactory = if (dataSourceFactory != null) {
@@ -1445,8 +1701,7 @@ class CS3IPlayer : IPlayer {
                 currentWindow,
                 playbackPosition,
                 playBackSpeed,
-                cacheSize = cacheSize,
-                videoBufferMs = videoBufferMs,
+                bufferingPolicy = bufferingPolicy,
                 playWhenReady = playWhenReady,
                 subtitleOffset = currentSubtitleOffset,
                 maxVideoHeight = maxVideoHeight,
@@ -1456,6 +1711,11 @@ class CS3IPlayer : IPlayer {
 
             event(PlayerAttachedEvent(exoPlayer))
             exoPlayer?.prepare()
+            val chunkedProgressive = bufferingPolicy is PlayerBufferingPolicy.Aggressive &&
+                    activeCache != null &&
+                    shouldChunkProgressiveCache(mediaSlices)
+            startSmartPrefetch(onlineSource, activeCache, bufferingPolicy, chunkedProgressive)
+            aggressiveLoadControl?.let { startAggressiveMonitor(it) }
 
             // For offline fragmented MP4s, FLAG_MERGE_FRAGMENTED_SIDX builds the SIDX seek map
             // incrementally as data is buffered. The initial seek resolves to the nearest merged
@@ -1804,7 +2064,7 @@ class CS3IPlayer : IPlayer {
                 val dataSourceFactory = createOnlineSource(audio.headers, interceptor)
                 DefaultMediaSourceFactory(dataSourceFactory).createMediaSource(mediaItem)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to create audio source for ${audio.url}: ${e.message}")
+                Log.e(TAG, "Failed to create audio source: ${e.javaClass.simpleName}")
                 null
             }
         }
@@ -1842,7 +2102,7 @@ class CS3IPlayer : IPlayer {
     @SuppressLint("UnsafeOptInUsageError")
     @MainThread
     private fun loadOnlinePlayer(context: Context, link: ExtractorLink, retry: Boolean = false) {
-        Log.i(TAG, "loadOnlinePlayer $link")
+        Log.i(TAG, "loadOnlinePlayer ${link.type}")
         try {
             val mime = when (link.type) {
                 ExtractorLinkType.M3U8 -> MimeTypes.APPLICATION_M3U8
@@ -1986,7 +2246,14 @@ class CS3IPlayer : IPlayer {
             val onlineSourceFactory =
                 createVideoSource(
                     link = link,
-                    engine = tryCreateEngine(context, simpleCacheSize),
+                    engine = tryCreateEngine(
+                        context,
+                        if (bufferingPolicy is PlayerBufferingPolicy.Aggressive) {
+                            AGGRESSIVE_HTTP_CACHE_BYTES
+                        } else {
+                            bufferingPolicy.legacyConfig().diskCacheBytes
+                        }
+                    ),
                     interceptor = interceptor
                 )
 
@@ -2021,6 +2288,7 @@ class CS3IPlayer : IPlayer {
 
     override fun reloadPlayer(context: Context) {
         Log.i(TAG, "reloadPlayer")
+        bufferingPolicy = BufferingPolicyResolver.resolve(context)
 
         releasePlayer(false)
         currentLink?.let {

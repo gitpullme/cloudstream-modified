@@ -37,6 +37,7 @@ fun CloudStreamThemeAppSettings(content: @Composable () -> Unit) {
     val primaryColor by settings.ui.primaryColor.collectAsState()
     val layout by settings.ui.layout.collectAsState()
     val layoutFlag = DeviceLayout.layoutToFlag(LocalContext.current, layout)
+    val isTvOrEmulator = layoutFlag and (TV or EMULATOR)
 
     CloudStreamTheme(
         mode = perfToMode(mode),
@@ -48,7 +49,8 @@ fun CloudStreamThemeAppSettings(content: @Composable () -> Unit) {
 
         CompositionLocalProvider(
             LocalBackPress provides backDispatcher::onBackPressed,
-            DeviceLayout.LocalLayout provides layoutFlag
+            DeviceLayout.LocalLayout provides layoutFlag,
+            LocalFocusOutlineDefault provides isTvOrEmulator
         ) {
             content()
         }

@@ -339,6 +339,14 @@
     <string name="video_buffer_length_settings">Video buffer length</string>
     <string name="video_buffer_disk_settings">Video cache on disk</string>
     <string name="video_buffer_clear_settings">Clear video and image cache</string>
+    <string name="aggressive_forward_buffer">Aggressive Forward Buffer</string>
+    <string name="aggressive_forward_buffer_description">Continuously tries to maintain your selected amount of playable video ahead of playback. Uses a separate resource-aware policy with two background prefetch connections. Actual buffer duration depends on the source, network and device.</string>
+    <string name="aggressive_forward_buffer_duration">Forward buffer target</string>
+    <string name="aggressive_forward_buffer_legacy_disabled">Inactive while Aggressive Forward Buffer is enabled.</string>
+    <plurals name="aggressive_forward_buffer_minutes">
+        <item quantity="one">%d minute</item>
+        <item quantity="other">%d minutes</item>
+    </plurals>
     <string name="android_tv_interface_on_seek_settings">Player Shown - Seek Amount</string>
     <string name="android_tv_interface_on_seek_settings_summary">The seek amount used when the player is visible</string>
     <string name="android_tv_interface_off_seek_settings">Player Hidden - Seek Amount</string>
@@ -814,4 +822,19 @@
     </plurals>
     <string name="player_is_live">Live</string>
     <string name="installed_plugins">Installed plugins</string>
+    <string name="network_stream_player">Network Stream Player</string>
+    <string name="local_proxy_notification_channel_name">Stream relay</string>
+    <string name="local_proxy_notification_channel_description">Keeps authenticated streams available while an external player is open</string>
+    <string name="local_proxy_notification_title">Streaming to external player</string>
+    <string name="local_proxy_notification_text">The local stream relay is active</string>
+    <string name="player_err_playback_failed">External player playback failed</string>
+    <string name="player_err_proxy_failed">Local streaming proxy error</string>
+    <string name="player_err_drm_unsupported">DRM format not supported by external player</string>
+    <string name="external_player_tracking_category">External player</string>
+    <string name="external_player_tracking">Track external player progress</string>
+    <string name="external_player_tracking_description">Save watch progress from Network Stream Player using its media session. Requires notification access.</string>
+    <string name="external_player_notification_access">Notification access</string>
+    <string name="external_player_notification_access_granted">Granted. Progress can be read while Network Stream Player is playing.</string>
+    <string name="external_player_notification_access_denied">Not granted. Tap to open Android notification access settings.</string>
+    <string name="external_player_notification_access_disabled">Tracking is disabled above.</string>
 </resources>

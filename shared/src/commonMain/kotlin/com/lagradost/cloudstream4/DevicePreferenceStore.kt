@@ -8,6 +8,8 @@ import com.lagradost.cloudstream3.TvType
 import com.mihon.common.preference.PreferenceStore
 import com.mihon.common.preference.getEnumSet
 
+const val EXTERNAL_PLAYER_TRACKING_ENABLED = "external_player_tracking_enabled"
+
 @Composable
 expect fun rememberAppSettings(): AppSettings
 
@@ -157,6 +159,10 @@ class ProviderPreferences(preferences: PreferenceStore) {
 
 class PlayerPreferences(preferences: PreferenceStore) {
     val episodeSync = preferences.getBoolean("episode_sync_enabled_key", true)
+    val externalPlayerTrackingEnabled = preferences.getBoolean(
+        EXTERNAL_PLAYER_TRACKING_ENABLED,
+        true
+    )
     val defaultPlayer = preferences.getString("player_default_key", "")
     val limitPlayerTitle = preferences.getInt("prefer_limit_title_key", 0)
     val hidePlayerControlNames = preferences.getBoolean("hide_player_control_names_key", false)
@@ -184,6 +190,18 @@ class PlayerPreferences(preferences: PreferenceStore) {
     val bufferDiskMB = preferences.getInt("video_buffer_disk_key", 0)
     val bufferRamMB = preferences.getInt("video_buffer_size_key", 0)
     val bufferTimeSec = preferences.getInt("video_buffer_length_key", 0)
+    val aggressiveBufferEnabled = preferences.getBoolean(
+        "aggressive_forward_buffer_enabled",
+        false
+    )
+    val aggressiveBufferMinutes = preferences.getInt(
+        "aggressive_forward_buffer_minutes",
+        5
+    )
+    val aggressiveBufferMaxParallelRequests = preferences.getInt(
+        "aggressive_forward_buffer_max_parallel_requests",
+        2
+    )
     val tvSeekOnTime = preferences.getInt("android_tv_interface_on_seek_key", 10)
     val tvSeekOffTime = preferences.getInt("android_tv_interface_off_seek_key", 10)
 }

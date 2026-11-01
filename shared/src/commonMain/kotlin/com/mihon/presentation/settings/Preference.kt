@@ -173,6 +173,20 @@ sealed class Preference {
     ) : Preference()
 }
 
+val Preference.contentType: String
+    get() = when (this) {
+        is Preference.PreferenceItem.SwitchPreference -> "switch_pref"
+        is Preference.PreferenceItem.ColorPreference -> "color_pref"
+        is Preference.PreferenceItem.SliderPreference -> "slider_pref"
+        is Preference.PreferenceItem.ListPreference<*> -> "list_pref"
+        is Preference.PreferenceItem.MultiSelectListPreference<*> -> "multiselect_pref"
+        is Preference.PreferenceItem.TextPreference -> "text_pref"
+        is Preference.PreferenceItem.EditTextPreference -> "edittext_pref"
+        is Preference.PreferenceItem.InfoPreference -> "info_pref"
+        is Preference.PreferenceItem.CustomPreference -> "custom_pref"
+        is Preference.PreferenceGroup -> "group"
+    }
+
 @Composable
 fun <T> PreferenceData<T>.collectAsState(): State<T> {
     val flow = remember(this) { changes() }

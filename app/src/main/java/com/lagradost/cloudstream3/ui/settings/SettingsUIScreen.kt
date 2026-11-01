@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.integerArrayResource
@@ -78,6 +80,37 @@ object SettingsUIScreen : SearchableSettings {
     @Composable
     override fun getPreferences(): List<Preference> {
         val settings = rememberAppSettings()
+        val context = LocalContext.current
+
+        val primaryColorEntries = remember(context) {
+            context.resources.getStringArray(R.array.themes_overlay_names_values).zip(
+                context.resources.getStringArray(R.array.themes_overlay_names)
+            ).toMap().toPersistentMap().mutate { map ->
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                    map.remove("Monet")
+                    map.remove("Monet2")
+                }
+            }
+        }
+
+        val themeEntries = remember(context) {
+            context.resources.getStringArray(R.array.themes_names_values).zip(
+                context.resources.getStringArray(R.array.themes_names)
+            ).toMap().toPersistentMap().mutate { map ->
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                    map.remove("Monet")
+                }
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    map.remove("System")
+                }
+            }
+        }
+
+        val layoutEntries = remember(context) {
+            context.resources.getIntArray(R.array.app_layout_values).toTypedArray().zip(
+                context.resources.getStringArray(R.array.app_layout)
+            ).toMap().toPersistentMap()
+        }
 
         return persistentListOf(
             Preference.PreferenceGroup(
@@ -87,14 +120,7 @@ object SettingsUIScreen : SearchableSettings {
                         preference = settings.ui.primaryColor,
                         icon = painterResource(R.drawable.colors_24px),
                         title = stringResource(R.string.primary_color_settings),
-                        entries = stringArrayResource(R.array.themes_overlay_names_values).zip(
-                            stringArrayResource(R.array.themes_overlay_names)
-                        ).toMap().toPersistentMap().mutate { map ->
-                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) { // remove monet on android 11 and less
-                                map.remove("Monet")
-                                map.remove("Monet2")
-                            }
-                        },
+                        entries = primaryColorEntries,
                         iconProvider = { k, _ ->
                             val color = perfToColor(k)
                             RoundColor(color.color)
@@ -110,16 +136,7 @@ object SettingsUIScreen : SearchableSettings {
                         preference = settings.ui.theme,
                         icon = painterResource(R.drawable.palette_24px),
                         title = stringResource(R.string.app_theme_settings),
-                        entries = stringArrayResource(R.array.themes_names_values).zip(
-                            stringArrayResource(R.array.themes_names)
-                        ).toMap().toPersistentMap().mutate { map ->
-                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) { // remove monet on android 11 and less
-                                map.remove("Monet")
-                            }
-                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) { // Remove system on android 9 and less
-                                map.remove("System")
-                            }
-                        },
+                        entries = themeEntries,
                         iconProvider = { k, _ ->
                             val theme = modeToTheme(perfToMode(k), CloudStreamPrimaryColor.NORMAL)
                             RoundColor(theme.background)
@@ -135,9 +152,7 @@ object SettingsUIScreen : SearchableSettings {
                         preference = settings.ui.layout,
                         icon = painterResource(R.drawable.responsive_layout_24px),
                         title = stringResource(R.string.app_layout),
-                        entries = integerArrayResource(R.array.app_layout_values).zip(
-                            stringArrayResource(R.array.app_layout)
-                        ).toMap().toPersistentMap(),
+                        entries = layoutEntries,
                         onValueChanged = { newValue ->
                             settings.ui.layout.set(newValue) // We need to set before we recreate
                             safe {

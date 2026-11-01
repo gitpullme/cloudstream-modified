@@ -108,16 +108,32 @@ object SettingsGeneralScreen : SearchableSettings {
             )
         }
 
-        val default = AllLanguagesName to stringResource(R.string.all_languages_preference)
-        val languages = APIHolder.apis.withLock {
-            APIHolder.apis.map { api -> api.lang }.distinct()
-        }.sortedBy { fromTagToLanguageName(it) ?: it }
+        val defaultName = stringResource(R.string.all_languages_preference)
+        val default = remember(defaultName) { AllLanguagesName to defaultName }
+        val languages = remember {
+            APIHolder.apis.withLock {
+                APIHolder.apis.map { api -> api.lang }.distinct()
+            }.sortedBy { fromTagToLanguageName(it) ?: it }
+        }
+        val appLanguageEntries = remember {
+            appLanguages.associate { (name, code) -> (code to (name to code).nameNextToFlagEmoji()) }
+        }
+        val providerLanguageEntries = remember(languages, default) {
+            mapOf(default) + languages.associateWith { lang ->
+                (getNameNextToFlagEmoji(lang) ?: lang)
+            }
+        }
+        val preferredMediaEntries = remember(context) {
+            TvType.entries.associate {
+                it.ordinal.toString() to context.getString(it.toStringRes())
+            }.toPersistentMap().remove(TvType.AnimeMovie.ordinal.toString())
+        }
 
         return persistentListOf(
             Preference.PreferenceGroup(title = stringResource(R.string.extension_language), preferenceItems = persistentListOf(
                 Preference.PreferenceItem.ListPreference(
                     preference = settings.general.locale,
-                    entries = appLanguages.associate { (name, code) -> (code to (name to code).nameNextToFlagEmoji()) },
+                    entries = appLanguageEntries,
                     title = stringResource(R.string.app_language),
                     icon = painterResource(R.drawable.language_korean_latin_24px),
                     onValueChanged = { value ->
@@ -130,22 +146,14 @@ object SettingsGeneralScreen : SearchableSettings {
                 Preference.PreferenceItem.MultiSelectListPreference(
                     title = stringResource(R.string.provider_lang_settings),
                     icon = painterResource(R.drawable.plugin_lang),
-                    entries = mapOf(default) + languages.associateWith { lang ->
-                        (getNameNextToFlagEmoji(
-                            lang
-                        ) ?: lang)
-                    },
+                    entries = providerLanguageEntries,
                     preference = settings.provider.extensionLanguages
                 ),
                 Preference.PreferenceItem.MultiSelectListPreference(
                     title = stringResource(R.string.preferred_media_settings),
                     icon = painterResource(R.drawable.movie_edit_24px),
                     preference = settings.provider.preferredMedia,
-                    entries = TvType.entries.associate {
-                        it.ordinal.toString() to stringResource(it.toStringRes())
-                    }
-                        // Ok this looks strange af, but we do this to avoid double movie
-                        .toPersistentMap().remove(TvType.AnimeMovie.ordinal.toString()), onValueChanged = { diff ->
+                    entries = preferredMediaEntries, onValueChanged = { diff ->
                         if(diff.contains(TvType.Movie.ordinal.toString())) {
                             settings.provider.preferredMedia.set(diff + TvType.AnimeMovie.ordinal.toString())
                         } else {

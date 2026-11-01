@@ -21,6 +21,10 @@ class WebVideoCastPackage: OpenInAppAction(
 
     override val oneSource = true
 
+    // Web Video Cast sends the URL to a TV/Chromecast, which cannot reach the
+    // phone's 127.0.0.1 relay. Keep its existing header handoff instead.
+    override val supportsLocalStreamProxy: Boolean = false
+
     override val sourceTypes = setOf(
         ExtractorLinkType.VIDEO,
         ExtractorLinkType.DASH,

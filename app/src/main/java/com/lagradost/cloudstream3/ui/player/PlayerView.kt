@@ -393,19 +393,6 @@ class PlayerView @JvmOverloads constructor(
 
             SubtitlesFragment.applyStyleEvent += subStyleListener
 
-            try {
-                val ctx = context
-                val settingsManager = PreferenceManager.getDefaultSharedPreferences(ctx)
-                val cs3 = player as? CS3IPlayer ?: return
-                cs3.cacheSize =
-                    settingsManager.getInt(context.getString(R.string.video_buffer_size_key), 0) * 1024L * 1024L
-                cs3.simpleCacheSize =
-                    settingsManager.getInt(context.getString(R.string.video_buffer_disk_key), 0) * 1024L * 1024L
-                cs3.videoBufferMs =
-                    settingsManager.getInt(context.getString(R.string.video_buffer_length_key), 0) * 1000L
-            } catch (e: Exception) {
-                logError(e)
-            }
 
             // Duration toggle click listeners
             exoDuration?.setOnClickListener { setRemainingTimeCounter(true) }

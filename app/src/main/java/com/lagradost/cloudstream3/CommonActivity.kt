@@ -34,8 +34,10 @@ import com.google.android.material.chip.ChipGroup
 import com.google.android.material.navigationrail.NavigationRailView
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.removeKey
+import com.lagradost.cloudstream3.actions.ExternalPlaybackSupport
 import com.lagradost.cloudstream3.actions.OpenInAppAction
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
+import com.lagradost.cloudstream3.actions.temp.NetworkStreamPlayerPackage
 import com.lagradost.cloudstream3.databinding.ToastBinding
 import com.lagradost.cloudstream3.mvvm.logError
 import com.lagradost.cloudstream3.syncproviders.AccountManager
@@ -254,13 +256,32 @@ object CommonActivity {
 
         MainActivity.activityResultLauncher =
             componentActivity.registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                // The external player has returned control, even when it reports
+                // RESULT_CANCELED. Release the relay before handling positions or
+                // cleaning up the stored action.
+                ExternalPlaybackSupport.stopActivePlayback(act)
+
+                val actionUid = getKey<String>("last_click_action")
+                val action = actionUid?.let { uid ->
+                    VideoClickActionHolder.getByUniqueId(uid) as? OpenInAppAction
+                }
+
+                // External players that never call setResult still need a
+                // chance to release tracking state. This must run for
+                // RESULT_CANCELED as well; an empty result is never treated as
+                // completion by the tracker.
+                action?.onExternalPlaybackReturned(result.resultCode, result.data)
+
                 if (result.resultCode == AppCompatActivity.RESULT_OK) {
-                    val actionUid =
-                        getKey<String>("last_click_action") ?: return@registerForActivityResult
-                    Log.d(TAG, "Loading action $actionUid result handler")
-                    val action = VideoClickActionHolder.getByUniqueId(actionUid) as? OpenInAppAction
-                        ?: return@registerForActivityResult
-                    action.onResultSafe(act, result.data)
+                    if (action != null) {
+                        Log.d(TAG, "Loading action $actionUid result handler")
+                        action.onResultSafe(act, result.data)
+                    }
+                    removeKey("last_click_action")
+                    removeKey("last_opened")
+                } else if (action is NetworkStreamPlayerPackage) {
+                    // Network Stream Player does not set a result. Clear the
+                    // launch marker once it has actually returned control.
                     removeKey("last_click_action")
                     removeKey("last_opened")
                 }

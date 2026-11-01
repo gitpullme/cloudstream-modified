@@ -121,11 +121,12 @@ fun CloudStreamTheme(
     content: @Composable () -> Unit,
 ) {
     val csColors = modeToTheme(mode, primaryColor)
+    val materialColors = remember(csColors) { csColors.toMaterial3ColorScheme() }
     val globalTransition = rememberInfiniteTransition(label = "GlobalSharedTransition")
     // We do not provide csColors as a global, because people should use MaterialTheme directly instead
     CompositionLocalProvider(LocalSharedInfiniteTransition provides globalTransition) {
         MaterialTheme(
-            colorScheme = csColors.toMaterial3ColorScheme(),
+            colorScheme = materialColors,
             content = content,
             typography = AppFont.typography
         )
