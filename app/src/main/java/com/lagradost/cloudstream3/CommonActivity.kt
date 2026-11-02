@@ -270,18 +270,22 @@ object CommonActivity {
                 // chance to release tracking state. This must run for
                 // RESULT_CANCELED as well; an empty result is never treated as
                 // completion by the tracker.
-                action?.onExternalPlaybackReturned(result.resultCode, result.data)
+                val externalHandled =
+                    action?.onExternalPlaybackReturned(result.resultCode, result.data) == true
 
                 if (result.resultCode == AppCompatActivity.RESULT_OK) {
                     if (action != null) {
                         Log.d(TAG, "Loading action $actionUid result handler")
                         action.onResultSafe(act, result.data)
                     }
-                    removeKey("last_click_action")
-                    removeKey("last_opened")
-                } else if (action is NetworkStreamPlayerPackage) {
+                    if (action !is NetworkStreamPlayerPackage || externalHandled) {
+                        removeKey("last_click_action")
+                        removeKey("last_opened")
+                    }
+                } else if (action is NetworkStreamPlayerPackage && externalHandled) {
                     // Network Stream Player does not set a result. Clear the
-                    // launch marker once it has actually returned control.
+                    // launch marker only when the tracker finalized the matching
+                    // pending launch; a stale result must not clear a newer one.
                     removeKey("last_click_action")
                     removeKey("last_opened")
                 }

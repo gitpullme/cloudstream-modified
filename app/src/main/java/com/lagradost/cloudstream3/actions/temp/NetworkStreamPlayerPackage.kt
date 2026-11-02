@@ -13,6 +13,7 @@ import com.lagradost.cloudstream3.actions.ExternalPlaybackMediaSessionTracker
 import com.lagradost.cloudstream3.actions.ExternalPlaybackRequestBuilder
 import com.lagradost.cloudstream3.actions.ExternalPlaybackSessionStore
 import com.lagradost.cloudstream3.actions.NetworkStreamPlayerLauncher
+import com.lagradost.cloudstream3.actions.PendingExternalPlayback
 import com.lagradost.cloudstream3.actions.OpenInAppAction
 import com.lagradost.cloudstream3.ui.result.LinkLoadingResult
 import com.lagradost.cloudstream3.ui.result.ResultEpisode
@@ -67,18 +68,21 @@ class NetworkStreamPlayerPackage : OpenInAppAction(
         // Persist the pending session before launch so it survives backgrounding.
         // Replacing any older marker prevents stale playback from leaking into
         // this launch.
+        var pending: PendingExternalPlayback? = null
         try {
             NetworkStreamPlayerLauncher.configureIntent(context, intent, request)
-            ExternalPlaybackSessionStore.begin(context, video, request, packageName)
+            pending = ExternalPlaybackSessionStore.begin(context, video, request, packageName)
             setKey("last_opened", video)
             launchResult(intent)
         } catch (e: ActivityNotFoundException) {
-            ExternalPlaybackSessionStore.clear()
+            pending?.let { ExternalPlaybackSessionStore.abandon(it) }
+                ?: ExternalPlaybackSessionStore.clear("launch-failed")
             NetworkStreamPlayerLauncher.stopActivePlayback(context)
-            Log.e("NetworkStreamPlayer", "ActivityNotFoundException for intent: $intent: ${e.message}")
+            Log.e("NetworkStreamPlayer", "ActivityNotFoundException: ${e.message}")
             CommonActivity.showToast("Network Stream Player could not open this stream format", Toast.LENGTH_LONG)
         } catch (t: Throwable) {
-            ExternalPlaybackSessionStore.clear()
+            pending?.let { ExternalPlaybackSessionStore.abandon(it) }
+                ?: ExternalPlaybackSessionStore.clear("launch-failed")
             NetworkStreamPlayerLauncher.stopActivePlayback(context)
             Log.e("NetworkStreamPlayer", "Failed to launch Network Stream Player: ${t.message}")
             CommonActivity.showToast(t.message ?: "Failed to launch player", Toast.LENGTH_LONG)
@@ -105,7 +109,7 @@ class NetworkStreamPlayerPackage : OpenInAppAction(
         NetworkStreamPlayerLauncher.stopActivePlayback(activity)
     }
 
-    override fun onExternalPlaybackReturned(resultCode: Int, intent: Intent?) {
-        ExternalPlaybackMediaSessionTracker.onActivityResult(resultCode, intent)
+    override fun onExternalPlaybackReturned(resultCode: Int, intent: Intent?): Boolean {
+        return ExternalPlaybackMediaSessionTracker.onActivityResult(resultCode, intent)
     }
 }

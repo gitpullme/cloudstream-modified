@@ -140,7 +140,7 @@ object NetworkStreamPlayerLauncher {
             Log.d(
                 TAG,
                 "Playback route=LOCAL_PROXY session=${session.sessionId.take(8)} " +
-                        "direct=${request.mediaUrl.substringBefore('?').take(40)}"
+                        "host=${request.mediaUrl.toUri().host ?: "unknown"}"
             )
             session
         } else {

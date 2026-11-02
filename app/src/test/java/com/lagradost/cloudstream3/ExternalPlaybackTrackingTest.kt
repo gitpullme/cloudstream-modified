@@ -93,6 +93,8 @@ class ExternalPlaybackTrackingTest {
         sessionToken: String = TOKEN,
         packageName: String = PACKAGE,
         title: String? = "Test Movie",
+        mediaId: String? = null,
+        queueItemId: Long = -1L,
     ): ExternalPlaybackSnapshot {
         return ExternalPlaybackSnapshot(
             packageName = packageName,
@@ -105,6 +107,8 @@ class ExternalPlaybackTrackingTest {
             lastPositionUpdateElapsedMs = lastPositionUpdateElapsedMs,
             observedAtElapsedMs = observedAtElapsedMs,
             title = title,
+            mediaId = mediaId,
+            queueItemId = queueItemId,
         )
     }
 
@@ -433,6 +437,18 @@ class ExternalPlaybackTrackingTest {
     }
 
     @Test
+    fun `session loss near the end still never marks completion`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        bind(engine, positionMs = 95_000L)
+
+        val update = engine.onSessionLost(at(6))
+
+        assertNotNull(update)
+        assertEquals(95_000L, update!!.positionMs)
+        assertFalse(update.completed)
+    }
+
+    @Test
     fun `empty activity result saves observed progress but never completion`() {
         val engine = ExternalPlaybackProgressEngine(pending())
         bind(engine)
@@ -528,9 +544,126 @@ class ExternalPlaybackTrackingTest {
     }
 
     @Test
-    fun `media change stops tracking instead of attributing progress to the launched episode`() {
+    fun `a different external title is diagnostic and never terminates tracking`() {
         val engine = ExternalPlaybackProgressEngine(pending(name = "Episode 1"))
         bind(engine, positionMs = 10_000L, title = "Episode 1")
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 15_000L,
+                observedAtElapsedMs = at(6),
+                title = "Provider file 1080p",
+            )
+        )
+
+        assertNotNull(update)
+        assertEquals(ExternalPlaybackSaveReason.PERIODIC, update!!.reason)
+        assertFalse(update.clearPending)
+        assertEquals(15_000L, update.positionMs)
+        assertEquals(TOKEN, engine.boundSessionToken)
+        assertTrue(engine.titleMismatchDetected)
+        assertNotNull(engine.lastTitleMismatchDescription)
+    }
+
+    @Test
+    fun `a title missing at bind time can be populated later`() {
+        val engine = ExternalPlaybackProgressEngine(pending(name = ""))
+        bind(engine, positionMs = 0L, title = null)
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+                title = "Test Show S01E01",
+            )
+        )
+
+        assertNotNull(update)
+        assertEquals(ExternalPlaybackSaveReason.PERIODIC, update!!.reason)
+        assertFalse(update.clearPending)
+        assertFalse(engine.titleMismatchDetected)
+    }
+
+    @Test
+    fun `a url derived title changing to a readable title keeps tracking`() {
+        val engine = ExternalPlaybackProgressEngine(pending(name = ""))
+        bind(
+            engine,
+            positionMs = 0L,
+            title = "https://cdn.example.com/shows/episode-1.m3u8",
+        )
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+                title = "Test Show - Episode 1",
+            )
+        )
+
+        assertNotNull(update)
+        assertEquals(ExternalPlaybackSaveReason.PERIODIC, update!!.reason)
+        assertFalse(update.clearPending)
+        assertFalse(engine.titleMismatchDetected)
+    }
+
+    @Test
+    fun `a metadata title with show name and episode number is weak evidence`() {
+        val engine = ExternalPlaybackProgressEngine(pending(name = "Test Show S01E01"))
+        bind(engine, positionMs = 0L, title = "Test Show S01E01")
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+                title = "Test Show - Episode 1",
+            )
+        )
+
+        assertNotNull(update)
+        assertEquals(ExternalPlaybackSaveReason.PERIODIC, update!!.reason)
+        assertFalse(update.clearPending)
+        assertFalse(engine.titleMismatchDetected)
+    }
+
+    @Test
+    fun `filename extensions and provider prefixes are weak title evidence`() {
+        val engine = ExternalPlaybackProgressEngine(pending(name = "Test Show S01E01"))
+        bind(engine, positionMs = 0L, title = "Test Show S01E01")
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+                title = "[Provider] Test.Show.S01E01.1080p.WEB-DL.mkv",
+            )
+        )
+
+        assertNotNull(update)
+        assertEquals(ExternalPlaybackSaveReason.PERIODIC, update!!.reason)
+        assertFalse(update.clearPending)
+        assertFalse(engine.titleMismatchDetected)
+    }
+
+    @Test
+    fun `genuine media change is detected by strong media id and preserves progress`() {
+        val engine = ExternalPlaybackProgressEngine(pending(name = "Episode 1"))
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 10_000L,
+                    observedAtElapsedMs = at(1),
+                    title = "Episode 1",
+                    mediaId = "episode-1",
+                )
+            )
+        )
 
         val update = engine.onSnapshot(
             snapshot(
@@ -539,6 +672,7 @@ class ExternalPlaybackTrackingTest {
                 durationMs = 200_000L,
                 observedAtElapsedMs = at(6),
                 title = "Episode 2",
+                mediaId = "episode-2",
             )
         )
 
@@ -546,6 +680,76 @@ class ExternalPlaybackTrackingTest {
         assertEquals(ExternalPlaybackSaveReason.MEDIA_CHANGED, update!!.reason)
         assertTrue(update.clearPending)
         assertEquals(10_000L, update.positionMs)
+        assertEquals(DURATION, update.durationMs)
+    }
+
+    @Test
+    fun `genuine media change is detected by queue item id`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    queueItemId = 1L,
+                )
+            )
+        )
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+                queueItemId = 2L,
+            )
+        )
+
+        assertNotNull(update)
+        assertEquals(ExternalPlaybackSaveReason.MEDIA_CHANGED, update!!.reason)
+        assertTrue(update.clearPending)
+    }
+
+    @Test
+    fun `rebinding a session keeps confirmed position and watched content`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        bind(engine, positionMs = 0L)
+        val first = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+            )
+        )
+        assertNotNull(first)
+        assertEquals(5_000L, first!!.watchedContentMs)
+
+        engine.rebindSession(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 60_000L,
+                observedAtElapsedMs = at(7),
+                sessionToken = "replacement-token",
+            ),
+            at(7),
+        )
+
+        assertEquals("replacement-token", engine.boundSessionToken)
+        assertEquals(5_000L, engine.watchedContentMs)
+        assertEquals(5_000L, engine.lastPersistedPositionMs)
+
+        val afterRebind = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 65_000L,
+                observedAtElapsedMs = at(12),
+                sessionToken = "replacement-token",
+            )
+        )
+        assertNotNull(afterRebind)
+        assertEquals(65_000L, afterRebind!!.positionMs)
+        assertEquals(10_000L, afterRebind.watchedContentMs)
     }
 
     @Test
@@ -569,6 +773,446 @@ class ExternalPlaybackTrackingTest {
         assertNotNull(update)
         assertEquals(ExternalPlaybackSaveReason.PERIODIC, update!!.reason)
         assertFalse(update.clearPending)
+    }
+
+    @Test
+    fun `zero update timestamps advance position between consecutive scans`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val first = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(6),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(first)
+        assertEquals(5_000L, first!!.positionMs)
+        assertEquals(5_000L, first.watchedContentMs)
+
+        val second = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(11),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(second)
+        assertEquals(10_000L, second!!.positionMs)
+        assertEquals(10_000L, second.watchedContentMs)
+    }
+
+    @Test
+    fun `a static timestamp-less position still makes progress without double counting`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val first = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(first)
+        assertEquals(5_000L, first!!.positionMs)
+
+        val second = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 10_000L,
+                observedAtElapsedMs = at(11),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(second)
+        assertEquals(10_000L, second!!.positionMs)
+        assertEquals(10_000L, second.watchedContentMs)
+    }
+
+    @Test
+    fun `fallback estimation respects playback speed changes`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    speed = 1f,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val atDoubleSpeed = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                speed = 2f,
+                observedAtElapsedMs = at(6),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(atDoubleSpeed)
+        assertEquals(5_000L, atDoubleSpeed!!.positionMs)
+
+        val later = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                speed = 2f,
+                observedAtElapsedMs = at(11),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(later)
+        assertEquals(15_000L, later!!.positionMs)
+        assertEquals(15_000L, later.watchedContentMs)
+    }
+
+    @Test
+    fun `fallback estimation ignores paused time`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        assertNotNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PAUSED,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(6),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(11),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val resumed = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(16),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(resumed)
+        assertEquals(5_000L, resumed!!.positionMs)
+        assertEquals(5_000L, resumed.watchedContentMs)
+    }
+
+    @Test
+    fun `fallback estimation ignores buffering time`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        assertNotNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.BUFFERING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(6),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(16),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val resumed = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(21),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(resumed)
+        assertEquals(5_000L, resumed!!.positionMs)
+        assertEquals(5_000L, resumed.watchedContentMs)
+    }
+
+    @Test
+    fun `switching between timestamp and fallback estimation does not double count`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = at(1),
+                )
+            )
+        )
+
+        val fallback = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(6),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(fallback)
+        assertEquals(5_000L, fallback!!.positionMs)
+
+        val timestamped = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 6_000L,
+                observedAtElapsedMs = at(11),
+                lastPositionUpdateElapsedMs = at(11),
+            )
+        )
+        assertNotNull(timestamped)
+        assertEquals(6_000L, timestamped!!.positionMs)
+        assertEquals(6_000L, timestamped.watchedContentMs)
+
+        val nextTimestamped = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 11_000L,
+                observedAtElapsedMs = at(16),
+                lastPositionUpdateElapsedMs = at(16),
+            )
+        )
+        assertNotNull(nextTimestamped)
+        assertEquals(11_000L, nextTimestamped!!.positionMs)
+        assertEquals(11_000L, nextTimestamped.watchedContentMs)
+    }
+
+    @Test
+    fun `fallback estimation caps long observation gaps`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(100),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(update)
+        assertEquals(ExternalPlaybackProgressEngine.DEFAULT_MAX_SAMPLE_GAP_MS, update!!.positionMs)
+        assertEquals(ExternalPlaybackProgressEngine.DEFAULT_MAX_SAMPLE_GAP_MS, update.watchedContentMs)
+    }
+
+    @Test
+    fun `fallback estimation detects forward and backward seeks without watched content`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val forward = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 50_000L,
+                observedAtElapsedMs = at(6),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(forward)
+        assertEquals(50_000L, forward!!.positionMs)
+        assertEquals(0L, forward.watchedContentMs)
+
+        val backward = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 10_000L,
+                observedAtElapsedMs = at(11),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(backward)
+        assertEquals(10_000L, backward!!.positionMs)
+        assertEquals(0L, backward.watchedContentMs)
+    }
+
+    @Test
+    fun `fallback estimation clamps positions to the known duration`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 95_000L,
+                    observedAtElapsedMs = at(1),
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 95_000L,
+                observedAtElapsedMs = at(6),
+                lastPositionUpdateElapsedMs = 0L,
+            )
+        )
+        assertNotNull(update)
+        assertEquals(DURATION, update!!.positionMs)
+        assertTrue(update.completed)
+    }
+
+    @Test
+    fun `zero snapshot duration falls back to the episode duration`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    durationMs = 0L,
+                    observedAtElapsedMs = at(1),
+                )
+            )
+        )
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                durationMs = 0L,
+                observedAtElapsedMs = at(6),
+            )
+        )
+        assertNotNull(update)
+        assertEquals(DURATION, update!!.durationMs)
+        assertEquals(5_000L, update.positionMs)
+    }
+
+    @Test
+    fun `a later snapshot never replaces a valid duration with zero`() {
+        val engine = ExternalPlaybackProgressEngine(pending())
+        bind(engine)
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                durationMs = 0L,
+                observedAtElapsedMs = at(6),
+            )
+        )
+        assertNotNull(update)
+        assertEquals(DURATION, update!!.durationMs)
+    }
+
+    @Test
+    fun `without any duration the session keeps its position until duration arrives`() {
+        val engine = ExternalPlaybackProgressEngine(pending(expectedDurationMs = 0L))
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    durationMs = 0L,
+                    observedAtElapsedMs = at(1),
+                )
+            )
+        )
+
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 5_000L,
+                    durationMs = 0L,
+                    observedAtElapsedMs = at(6),
+                )
+            )
+        )
+        assertEquals(5_000L, engine.lastKnownPositionMs)
+        assertEquals(0L, engine.lastKnownDurationMs)
+        assertFalse(engine.completed)
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 10_000L,
+                durationMs = DURATION,
+                observedAtElapsedMs = at(11),
+            )
+        )
+        assertNotNull(update)
+        assertEquals(DURATION, update!!.durationMs)
+        assertEquals(10_000L, update.positionMs)
     }
 
     @Test

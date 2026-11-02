@@ -150,7 +150,8 @@ abstract class OpenInAppAction(
      * for RESULT_OK. Actions that monitor the player independently can use this
      * to release tracking state even when the player returns no data.
      */
-    open fun onExternalPlaybackReturned(resultCode: Int, intent: Intent?) {
+    open fun onExternalPlaybackReturned(resultCode: Int, intent: Intent?): Boolean {
+        return false
     }
 
     /** Safe version of onResult, we don't trust extension devs to not crash the app */
