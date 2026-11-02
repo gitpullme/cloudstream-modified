@@ -1759,4 +1759,487 @@ class ExternalPlaybackTrackerIntegrationTest {
         val pastTotalGrace = atExpiry + 30_001L
         assertEquals(ExternalPlaybackExpired, engine.onTick(pastTotalGrace))
     }
+
+    // ==================== ADDITIONAL SPECIFIC REGRESSION TESTS ====================
+
+    // --- Section 1: Expiration ordering and discovery failure safety ---
+
+    @Test
+    fun `pending episode older than 120s is not deleted when active session query returns matching PLAYING session`() {
+        // Pending started at START (e.g. 1_000_000L).
+        val store = FakePendingStore(pending())
+        val source = FakeSessionSource()
+        val sink = FakeProgressSink()
+        // Clock is 150 seconds past launch (> 120s unbound expiry).
+        val clock = FakeClock(START + 150_000L)
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 150_000L,
+                    durationMs = 300_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = clock.now,
+                )
+            )
+        )
+
+        val core = tracker(clock, source, store, sink)
+        val outcome = core.scan()
+
+        // Must NOT expire; must bind to the playing session
+        assertTrue(
+            "Expected TRACKING or SAVED but got $outcome",
+            outcome == ExternalPlaybackScanOutcome.TRACKING || outcome == ExternalPlaybackScanOutcome.SAVED
+        )
+        assertEquals(TOKEN_A, core.boundSessionToken)
+        assertNotNull("Pending episode must be retained", store.current)
+        assertTrue("Pending episode must not be cleared", store.clears.isEmpty())
+    }
+
+    @Test
+    fun `tracker recreated after listener disconnection can bind to an already-playing session and continue saving progress`() {
+        val store = FakePendingStore(pending())
+        val source = FakeSessionSource()
+        val sink = FakeProgressSink()
+        val clock = FakeClock(START + 1_000L)
+
+        // First core starts tracking
+        source.sessions = listOf(
+            session(snapshot(token = TOKEN_A, positionMs = 0L, observedAtElapsedMs = clock.now))
+        )
+        val firstCore = tracker(clock, source, store, sink)
+        firstCore.scan()
+        assertEquals(TOKEN_A, firstCore.boundSessionToken)
+
+        // Listener disconnects, resetting first core
+        firstCore.reset("listener-disconnected")
+
+        // 140s later (past 120s unbound expiry), listener reconnects with a fresh core
+        clock.now = START + 140_000L
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 139_000L,
+                    durationMs = 300_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = clock.now,
+                )
+            )
+        )
+        val secondCore = tracker(clock, source, store, sink)
+        val outcome1 = secondCore.scan()
+        assertEquals(TOKEN_A, secondCore.boundSessionToken)
+        assertNotNull(store.current)
+
+        // 5 seconds later, progress is saved
+        clock.now = START + 145_000L
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 144_000L,
+                    durationMs = 300_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = clock.now,
+                )
+            )
+        )
+        val outcome2 = secondCore.scan()
+        assertEquals(ExternalPlaybackScanOutcome.SAVED, outcome2)
+        assertEquals(144_000L, sink.updates.last().positionMs)
+    }
+
+    @Test
+    fun `SecurityException from active-session discovery does not cause immediate expiration`() {
+        val store = FakePendingStore(pending())
+        val source = FakeSessionSource()
+        val sink = FakeProgressSink()
+        val clock = FakeClock(START + 130_000L)
+
+        source.failure = SecurityException("Permission Denial")
+        val core = tracker(clock, source, store, sink)
+        val outcome = core.scan()
+
+        assertEquals(ExternalPlaybackScanOutcome.PERMISSION_MISSING, outcome)
+        assertTrue(core.permissionMissing)
+        assertNotNull("Pending episode must be retained across SecurityException", store.current)
+        assertTrue("Pending must not be cleared on permission failure", store.clears.isEmpty())
+    }
+
+    @Test
+    fun `subsequent successful scan recovers and tracks after SecurityException`() {
+        val store = FakePendingStore(pending())
+        val source = FakeSessionSource()
+        val sink = FakeProgressSink()
+        val clock = FakeClock(START + 130_000L)
+
+        source.failure = SecurityException("Permission Denial")
+        val core = tracker(clock, source, store, sink)
+        core.scan()
+
+        // Access restored 5s later
+        clock.now = START + 135_000L
+        source.failure = null
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 135_000L,
+                    durationMs = 300_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = clock.now,
+                )
+            )
+        )
+        val recovered = core.scan()
+
+        assertFalse(core.permissionMissing)
+        assertEquals(TOKEN_A, core.boundSessionToken)
+        assertNotNull(store.current)
+    }
+
+    // --- Section 2: Stale bound-session detection and replacement ---
+
+    @Test
+    fun `bound session remains PAUSED with timestamp zero and playing Session B is selected`() {
+        val pending = pending()
+        val clock = FakeClock(START + 10_000L)
+
+        val pausedA = ExternalPlaybackSession(
+            packageName = PACKAGE,
+            sessionToken = TOKEN_A,
+            snapshot = snapshot(
+                token = TOKEN_A,
+                state = ExternalPlaybackState.PAUSED,
+                positionMs = 5_000L,
+                observedAtElapsedMs = clock.now,
+                lastPositionUpdateElapsedMs = 0L,
+                mediaId = "ep-1",
+            ),
+        )
+        val playingB = ExternalPlaybackSession(
+            packageName = PACKAGE,
+            sessionToken = TOKEN_B,
+            snapshot = snapshot(
+                token = TOKEN_B,
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 8_000L,
+                observedAtElapsedMs = clock.now,
+                lastPositionUpdateElapsedMs = clock.now,
+                mediaId = "ep-1",
+            ),
+        )
+
+        val selection = ExternalPlaybackSessionSelector.select(
+            sessions = listOf(pausedA, playingB),
+            pending = pending,
+            boundToken = TOKEN_A,
+            nowElapsedMs = clock.now,
+        )
+
+        assertTrue("Playing Session B must replace timestamp-less PAUSED Session A", selection is ExternalPlaybackSessionSelection.Select)
+        assertEquals(TOKEN_B, (selection as ExternalPlaybackSessionSelection.Select).session.sessionToken)
+        assertTrue(selection.replacingBoundSession)
+    }
+
+    @Test
+    fun `bound session remains IDLE with timestamp zero and playing Session B is selected`() {
+        val pending = pending()
+        val clock = FakeClock(START + 10_000L)
+
+        val idleA = ExternalPlaybackSession(
+            packageName = PACKAGE,
+            sessionToken = TOKEN_A,
+            snapshot = snapshot(
+                token = TOKEN_A,
+                state = ExternalPlaybackState.IDLE,
+                positionMs = 0L,
+                observedAtElapsedMs = clock.now,
+                lastPositionUpdateElapsedMs = 0L,
+                mediaId = "ep-1",
+            ),
+        )
+        val playingB = ExternalPlaybackSession(
+            packageName = PACKAGE,
+            sessionToken = TOKEN_B,
+            snapshot = snapshot(
+                token = TOKEN_B,
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 8_000L,
+                observedAtElapsedMs = clock.now,
+                lastPositionUpdateElapsedMs = clock.now,
+                mediaId = "ep-1",
+            ),
+        )
+
+        val selection = ExternalPlaybackSessionSelector.select(
+            sessions = listOf(idleA, playingB),
+            pending = pending,
+            boundToken = TOKEN_A,
+            nowElapsedMs = clock.now,
+        )
+
+        assertTrue("Playing Session B must replace timestamp-less IDLE Session A", selection is ExternalPlaybackSessionSelection.Select)
+        assertEquals(TOKEN_B, (selection as ExternalPlaybackSessionSelection.Select).session.sessionToken)
+    }
+
+    @Test
+    fun `bound session with timestamp before launch is replaced by post-launch playing session`() {
+        val pending = pending()
+        val clock = FakeClock(START + 10_000L)
+
+        // Session A has timestamp 5 seconds before the pending launch
+        val preLaunchA = ExternalPlaybackSession(
+            packageName = PACKAGE,
+            sessionToken = TOKEN_A,
+            snapshot = snapshot(
+                token = TOKEN_A,
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 50_000L,
+                observedAtElapsedMs = clock.now,
+                lastPositionUpdateElapsedMs = START - 5_000L,
+                mediaId = "ep-1",
+            ),
+        )
+        val postLaunchB = ExternalPlaybackSession(
+            packageName = PACKAGE,
+            sessionToken = TOKEN_B,
+            snapshot = snapshot(
+                token = TOKEN_B,
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 8_000L,
+                observedAtElapsedMs = clock.now,
+                lastPositionUpdateElapsedMs = START + 8_000L,
+                mediaId = "ep-1",
+            ),
+        )
+
+        val selection = ExternalPlaybackSessionSelector.select(
+            sessions = listOf(preLaunchA, postLaunchB),
+            pending = pending,
+            boundToken = TOKEN_A,
+            nowElapsedMs = clock.now,
+        )
+
+        assertTrue(selection is ExternalPlaybackSessionSelection.Select)
+        assertEquals(TOKEN_B, (selection as ExternalPlaybackSessionSelection.Select).session.sessionToken)
+    }
+
+    @Test
+    fun `timestamp-less session that genuinely remains PLAYING and advances position continues to be tracked`() {
+        val clock = FakeClock(START + 1_000L)
+        val source = FakeSessionSource()
+        val store = FakePendingStore(pending())
+        val sink = FakeProgressSink()
+        val core = tracker(clock, source, store, sink)
+
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    positionMs = 0L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        core.scan()
+
+        clock.now = START + 6_000L
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    positionMs = 5_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        val outcome1 = core.scan()
+        assertEquals(ExternalPlaybackScanOutcome.SAVED, outcome1)
+        assertEquals(5_000L, sink.updates.last().positionMs)
+
+        clock.now = START + 11_000L
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    positionMs = 10_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        val outcome2 = core.scan()
+        assertEquals(ExternalPlaybackScanOutcome.SAVED, outcome2)
+        assertEquals(10_000L, sink.updates.last().positionMs)
+    }
+
+    @Test
+    fun `actual pause followed by resume on the same token does not clear pending episode`() {
+        val clock = FakeClock(START + 1_000L)
+        val source = FakeSessionSource()
+        val store = FakePendingStore(pending())
+        val sink = FakeProgressSink()
+        val core = tracker(clock, source, store, sink)
+
+        // Session A playing
+        source.sessions = listOf(
+            session(snapshot(token = TOKEN_A, positionMs = 5_000L, observedAtElapsedMs = clock.now))
+        )
+        core.scan()
+        assertEquals(TOKEN_A, core.boundSessionToken)
+
+        // Paused with timestamp 0, no other sessions
+        clock.now = START + 6_000L
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PAUSED,
+                    positionMs = 5_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = 0L,
+                )
+            )
+        )
+        val pauseOutcome = core.scan()
+        assertEquals(ExternalPlaybackScanOutcome.SAVED, pauseOutcome)
+        assertEquals(TOKEN_A, core.boundSessionToken)
+        assertNotNull("Pause must not clear pending episode", store.current)
+
+        // Resume playing on same token
+        clock.now = START + 12_000L
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 10_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = clock.now,
+                )
+            )
+        )
+        val resumeOutcome = core.scan()
+        assertEquals(ExternalPlaybackScanOutcome.SAVED, resumeOutcome)
+        assertEquals(TOKEN_A, core.boundSessionToken)
+        assertEquals(10_000L, sink.updates.last().positionMs)
+    }
+
+    // --- Section 4: History save validation ---
+
+    @Test
+    fun `saveProgress rejects writes below thirty second minimum duration`() {
+        var written = false
+        val writer = ExternalPlaybackHistoryWriter { _, _ -> written = true }
+        val pending = pending()
+        val update = ExternalPlaybackUpdate(
+            positionMs = 5_000L,
+            durationMs = 29_999L, // Below 30s minimum
+            watchedContentMs = 5_000L,
+            state = ExternalPlaybackState.PLAYING,
+            reason = ExternalPlaybackSaveReason.PERIODIC,
+            immediate = false,
+            completed = false,
+            sessionEnded = false,
+            clearPending = false,
+        )
+
+        val result = ExternalPlaybackSessionStore.saveProgress(pending, update, writer)
+        assertFalse("saveProgress must return false when duration is below 30s", result)
+        assertFalse(written)
+    }
+
+    @Test
+    fun `saveProgress accepts writes at or above thirty second minimum duration`() {
+        var written = false
+        val writer = ExternalPlaybackHistoryWriter { _, _ -> written = true }
+        val pending = pending()
+        val update = ExternalPlaybackUpdate(
+            positionMs = 5_000L,
+            durationMs = 30_000L, // At 30s minimum
+            watchedContentMs = 5_000L,
+            state = ExternalPlaybackState.PLAYING,
+            reason = ExternalPlaybackSaveReason.PERIODIC,
+            immediate = false,
+            completed = false,
+            sessionEnded = false,
+            clearPending = false,
+        )
+
+        val result = ExternalPlaybackSessionStore.saveProgress(pending, update, writer)
+        assertTrue("saveProgress must succeed when duration is at least 30s", result)
+        assertTrue(written)
+    }
+
+    // --- Section 6: Complete end-to-end progress chain test ---
+
+    @Test
+    fun `complete progress tracking chain from launch to history write`() {
+        val clock = FakeClock(START + 1_000L)
+        val source = FakeSessionSource()
+        val store = FakePendingStore(pending(initialPositionMs = 0L, expectedDurationMs = 120_000L))
+        val sink = FakeProgressSink()
+        val core = tracker(clock, source, store, sink)
+
+        // 1. MediaSession discovered for com.genuine.leone
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    durationMs = 120_000L,
+                    observedAtElapsedMs = clock.now,
+                    title = "Test Movie",
+                    mediaId = "ep-12345",
+                )
+            )
+        )
+
+        // 2. Scan selects and binds correct session
+        val firstScan = core.scan()
+        assertEquals(ExternalPlaybackScanOutcome.TRACKING, firstScan)
+        assertEquals(TOKEN_A, core.boundSessionToken)
+        assertNotNull(store.current)
+
+        // 3. Playback position advances by 10s
+        clock.now = START + 6_000L
+        source.sessions = listOf(
+            session(
+                snapshot(
+                    token = TOKEN_A,
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 10_000L,
+                    durationMs = 120_000L,
+                    observedAtElapsedMs = clock.now,
+                    lastPositionUpdateElapsedMs = clock.now,
+                    title = "Test Movie",
+                    mediaId = "ep-12345",
+                )
+            )
+        )
+
+        // 4. Progress engine emits update and sink receives correct episode ID and position
+        val secondScan = core.scan()
+        assertEquals(ExternalPlaybackScanOutcome.SAVED, secondScan)
+        assertEquals(1, sink.updates.size)
+        val savedUpdate = sink.updates.single()
+        assertEquals(10_000L, savedUpdate.positionMs)
+        assertEquals(120_000L, savedUpdate.durationMs)
+        assertEquals(EPISODE_ID, store.current?.episode?.id)
+
+        // 5. Activity result finalizes playback cleanly
+        clock.now = START + 15_000L
+        assertTrue(core.onActivityResult("pending-1", 10_000L, 120_000L))
+        assertNull("Pending state must be cleared after matching activity result", store.current)
+    }
 }

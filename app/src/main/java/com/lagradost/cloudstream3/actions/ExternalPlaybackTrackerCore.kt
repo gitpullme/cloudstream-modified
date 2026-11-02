@@ -81,48 +81,66 @@ object ExternalPlaybackSessionSelector {
         pending: PendingExternalPlayback,
         boundToken: String?,
         nowElapsedMs: Long,
+        diagnostics: (String) -> Unit = {},
     ): ExternalPlaybackSessionSelection {
         if (boundToken != null) {
             val boundSession = sessions.firstOrNull { it.sessionToken == boundToken }
             if (boundSession != null) {
                 // Check whether the bound session is still genuinely usable.
-                if (isBoundSessionUsable(boundSession.snapshot, nowElapsedMs)) {
+                val isUsable = isBoundSessionUsable(boundSession.snapshot, pending, nowElapsedMs)
+                if (isUsable) {
+                    diagnostics("bound token retained: token=${shortToken(boundToken)} state=${boundSession.snapshot.state} (actively usable)")
                     return ExternalPlaybackSessionSelection.Bound(boundSession)
                 }
-                // Bound session exists but is terminal or stale. Consider replacements.
+                // Bound session exists but is terminal, stale, or no longer demonstrably active (e.g. timestamp-less PAUSED/IDLE).
+                // Inspect compatible replacement candidates before returning the old Bound result.
                 val replacements = sessions.filter {
                     it.sessionToken != boundToken && !isClearlyStale(it.snapshot, pending)
                 }
                 if (replacements.isEmpty()) {
-                    // No replacement available — keep the bound session (it still exists).
+                    // No replacement available — keep the bound session (it still exists, e.g. normal pause).
+                    diagnostics("bound token retained: token=${shortToken(boundToken)} (stale/paused but only compatible session)")
                     return ExternalPlaybackSessionSelection.Bound(boundSession)
                 }
                 // Rank replacements; pick one only if it has stronger evidence.
                 val ranked = rankCandidates(replacements, pending, nowElapsedMs)
                 if (ranked == null) {
-                    // Replacements are ambiguous or absent — keep the stale bound.
+                    // Replacements are ambiguous — keep the existing bound session.
+                    diagnostics("bound token retained: token=${shortToken(boundToken)} (replacements are ambiguous)")
                     return ExternalPlaybackSessionSelection.Bound(boundSession)
                 }
                 val replacement = ranked.first
-                // A replacement needs active playback evidence to unseat a bound session.
+                // A compatible replacement that is genuinely PLAYING or BUFFERING replaces a stale/inactive bound session.
                 if (isActivelyPlaying(replacement.snapshot)) {
+                    diagnostics(
+                        "bound token replaced: old=${shortToken(boundToken)} (state=${boundSession.snapshot.state}) " +
+                                "new=${shortToken(replacement.sessionToken)} (state=${replacement.snapshot.state}) reason=active_replacement"
+                    )
                     return ExternalPlaybackSessionSelection.Select(
                         session = replacement,
                         replacingBoundSession = true,
                     )
                 }
-                // Replacement is not clearly better; keep the existing bound session.
+                // Replacement is not actively playing; keep the existing bound session.
+                diagnostics("bound token retained: token=${shortToken(boundToken)} (replacement not actively playing)")
                 return ExternalPlaybackSessionSelection.Bound(boundSession)
             }
             // Bound token is gone from the active list; fall through to candidate selection.
         }
 
-        val candidates = sessions.filterNot { isClearlyStale(it.snapshot, pending) }
+        val candidates = sessions.filter {
+            val stale = isClearlyStale(it.snapshot, pending)
+            if (stale) {
+                diagnostics("candidate rejected token=${shortToken(it.sessionToken)}: update timestamp before launch (${it.snapshot.lastPositionUpdateElapsedMs} < ${pending.startedAtElapsedRealtimeMs})")
+            }
+            !stale
+        }
         if (candidates.isEmpty()) return ExternalPlaybackSessionSelection.None
 
         val ranked = rankCandidates(candidates, pending, nowElapsedMs)
             ?: return ExternalPlaybackSessionSelection.Ambiguous
 
+        diagnostics("candidate selected token=${shortToken(ranked.first.sessionToken)} state=${ranked.first.snapshot.state} replacingBound=${boundToken != null}")
         return ExternalPlaybackSessionSelection.Select(
             session = ranked.first,
             replacingBoundSession = boundToken != null,
@@ -130,29 +148,72 @@ object ExternalPlaybackSessionSelector {
     }
 
     /**
-     * A bound session is usable when it is not in a terminal state and its
-     * position updates are reasonably fresh.
+     * A bound session is usable when it is not in a terminal state, not older than
+     * the pending launch, and still producing updates or actively playing.
      */
     fun isBoundSessionUsable(
         snapshot: ExternalPlaybackSnapshot,
+        pending: PendingExternalPlayback,
         nowElapsedMs: Long,
     ): Boolean {
-        // Terminal states: the session has ended.
+        // STOPPED, ERROR, and NONE sessions are not usable active sessions.
         if (snapshot.state == ExternalPlaybackState.STOPPED ||
             snapshot.state == ExternalPlaybackState.ERROR ||
             snapshot.state == ExternalPlaybackState.NONE
         ) {
             return false
         }
-        // If the session has a position update timestamp, check recency.
+        // If the session has a position update timestamp, it must not be older than current launch.
+        if (snapshot.lastPositionUpdateElapsedMs > 0L) {
+            if (snapshot.lastPositionUpdateElapsedMs <
+                pending.startedAtElapsedRealtimeMs - FRESHNESS_TOLERANCE_MS
+            ) {
+                return false
+            }
+            val staleness = nowElapsedMs - snapshot.lastPositionUpdateElapsedMs
+            if (staleness > STALE_UPDATE_THRESHOLD_MS) {
+                return false
+            }
+        } else {
+            // A timestamp-less PAUSED or IDLE session must not automatically be treated as current.
+            if (snapshot.state == ExternalPlaybackState.PAUSED ||
+                snapshot.state == ExternalPlaybackState.IDLE
+            ) {
+                return false
+            }
+        }
+        // PLAYING, BUFFERING or fresh sessions are usable.
+        return true
+    }
+
+    fun isBoundSessionUsable(
+        snapshot: ExternalPlaybackSnapshot,
+        nowElapsedMs: Long,
+    ): Boolean {
+        if (snapshot.state == ExternalPlaybackState.STOPPED ||
+            snapshot.state == ExternalPlaybackState.ERROR ||
+            snapshot.state == ExternalPlaybackState.NONE
+        ) {
+            return false
+        }
         if (snapshot.lastPositionUpdateElapsedMs > 0L) {
             val staleness = nowElapsedMs - snapshot.lastPositionUpdateElapsedMs
             if (staleness > STALE_UPDATE_THRESHOLD_MS) {
                 return false
             }
+        } else {
+            if (snapshot.state == ExternalPlaybackState.PAUSED ||
+                snapshot.state == ExternalPlaybackState.IDLE
+            ) {
+                return false
+            }
         }
-        // PLAYING, PAUSED, BUFFERING, IDLE with fresh updates are usable.
         return true
+    }
+
+    private fun shortToken(token: String?): String {
+        if (token.isNullOrBlank()) return "none"
+        return Integer.toHexString(token.hashCode())
     }
 
     private fun isActivelyPlaying(snapshot: ExternalPlaybackSnapshot): Boolean {
@@ -325,18 +386,6 @@ class ExternalPlaybackTrackerCore(
         val tracker = engineFor(pending)
         val now = clock.nowElapsedMs()
 
-        // The candidate-presence flag is set below after scanning sessions.
-        // For the tick check, preserve the previous state until we know.
-        if (tracker.onTick(now) == ExternalPlaybackExpired) {
-            pendingStore.clear("expired")
-            reset("expired")
-            diagnostics("EXPIRED: pending expired: ${tracker.lastDecision}")
-            return finish(
-                ExternalPlaybackScanOutcome.EXPIRED,
-                "pending expired: ${tracker.lastDecision}"
-            )
-        }
-
         val sessions = try {
             sessionSource.activeSessions()
         } catch (t: SecurityException) {
@@ -353,15 +402,36 @@ class ExternalPlaybackTrackerCore(
         }
         permissionMissing = false
 
+        diagnostics(
+            "scan pending=${shortId(pending.sessionId)} activeSessions=${sessions.size} " +
+                    "matchingPackage=${sessions.count { it.packageName == pending.packageName }} " +
+                    "bound=${shortToken(tracker.boundSessionToken)} now=$now"
+        )
+        for (s in sessions) {
+            val snap = s.snapshot
+            diagnostics(
+                "active session pkg=${snap.packageName} token=${shortToken(snap.sessionToken)} " +
+                        "state=${snap.state} pos=${snap.positionMs}ms dur=${snap.durationMs}ms " +
+                        "lastUpdate=${snap.lastPositionUpdateElapsedMs} actions=${snap.actions} " +
+                        "hasMediaId=${!snap.mediaId.isNullOrBlank()} queueItem=${snap.queueItemId} " +
+                        "title=${sanitizedTitle(snap.title)}"
+            )
+        }
+
         val matching = sessions.filter { it.packageName == pending.packageName }
         // Update candidate-presence flag for the engine's tick-based expiration.
         tracker.hasCandidates = matching.isNotEmpty()
-        diagnostics(
-            "scan pending=${shortId(pending.sessionId)} sessions=${sessions.size} " +
-                    "matching=${matching.size} " +
-                    "packages=${matching.map { it.packageName }.distinct().joinToString(",")} " +
-                    "bound=${shortToken(tracker.boundSessionToken)} now=$now"
-        )
+
+        if (tracker.onTick(now) == ExternalPlaybackExpired) {
+            pendingStore.clear("expired")
+            reset("expired")
+            diagnostics("EXPIRED: pending expired: ${tracker.lastDecision}")
+            return finish(
+                ExternalPlaybackScanOutcome.EXPIRED,
+                "pending expired: ${tracker.lastDecision}"
+            )
+        }
+
         if (matching.isEmpty()) {
             return onNoSession(tracker, pending, now, "no matching package session")
         }
@@ -370,7 +440,7 @@ class ExternalPlaybackTrackerCore(
         // from the same package compete for tracking.
         val boundToken = tracker.boundSessionToken
         val boundSession = boundToken?.let { tok -> matching.firstOrNull { it.sessionToken == tok } }
-        if (boundSession != null && !ExternalPlaybackSessionSelector.isBoundSessionUsable(boundSession.snapshot, now)) {
+        if (boundSession != null && !ExternalPlaybackSessionSelector.isBoundSessionUsable(boundSession.snapshot, pending, now)) {
             diagnostics(
                 "STALE_BOUND_SESSION: token=${shortToken(boundToken)} " +
                         "state=${boundSession.snapshot.state} " +
@@ -383,8 +453,11 @@ class ExternalPlaybackTrackerCore(
             matching
         } else {
             matching.filter {
-                it.sessionToken == boundToken ||
-                        replacementMatchesIdentity(tracker, it.snapshot)
+                val matches = it.sessionToken == boundToken || replacementMatchesIdentity(tracker, it.snapshot)
+                if (!matches) {
+                    diagnostics("candidate rejected token=${shortToken(it.sessionToken)}: media identity mismatch with bound item")
+                }
+                matches
             }
         }
         if (candidates.isEmpty()) {
@@ -401,6 +474,7 @@ class ExternalPlaybackTrackerCore(
             pending = pending,
             boundToken = boundToken,
             nowElapsedMs = now,
+            diagnostics = diagnostics,
         )) {
             is ExternalPlaybackSessionSelection.Bound -> {
                 process(selection.session, tracker, pending, now)
@@ -489,7 +563,10 @@ class ExternalPlaybackTrackerCore(
             if (!saved) {
                 // Do not delete the only record of a position that failed to
                 // reach the existing history store.
-                tracker.onPersistFailed()
+                val episodeId: Int? = pending.episode.id
+                if (episodeId != null && episodeId > 0) {
+                    tracker.onPersistFailed()
+                }
                 pendingStore.updateObserved(
                     pending,
                     tracker.lastKnownPositionMs,
@@ -555,7 +632,10 @@ class ExternalPlaybackTrackerCore(
                     "persist failed episode=${pending.episode.id} reason=${update.reason} " +
                             "pos=${update.positionMs}ms dur=${update.durationMs}ms"
                 )
-                tracker.onPersistFailed()
+                val episodeId: Int? = pending.episode.id
+                if (episodeId != null && episodeId > 0) {
+                    tracker.onPersistFailed()
+                }
             }
             if (update.clearPending) {
                 if (!saved) {
@@ -585,6 +665,7 @@ class ExternalPlaybackTrackerCore(
             }
             diagnostics(
                 "no-persist episode=${pending.episode.id} reason=${tracker.lastDecision} " +
+                        "resumeProtected=${tracker.lastDecision == "resume-guard"} " +
                         "effective=${tracker.lastEffectivePositionMs}ms " +
                         "duration=${tracker.lastKnownDurationMs}ms " +
                         "titleMismatch=${tracker.lastTitleMismatchDescription ?: "none"}"
@@ -635,7 +716,10 @@ class ExternalPlaybackTrackerCore(
         if (update != null) {
             val saved = progressSink.save(pending, update)
             pendingStore.updateObserved(pending, update.positionMs, update.durationMs)
-            if (!saved) tracker.onPersistFailed()
+            val episodeId: Int? = pending.episode.id
+            if (!saved && episodeId != null && episodeId > 0) {
+                tracker.onPersistFailed()
+            }
             diagnostics(
                 "session lost episode=${pending.episode.id} saved=$saved " +
                         "pos=${update.positionMs}ms dur=${update.durationMs}ms"

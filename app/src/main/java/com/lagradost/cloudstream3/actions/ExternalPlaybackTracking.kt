@@ -916,16 +916,25 @@ object ExternalPlaybackSessionStore {
         clear("unspecified")
     }
 
+    const val MIN_HISTORY_DURATION_MS = 30_000L
+
     fun saveProgress(
         pending: PendingExternalPlayback,
         update: ExternalPlaybackUpdate,
         writer: ExternalPlaybackHistoryWriter = dataStoreHistoryWriter,
     ): Boolean {
-        if (update.durationMs <= 0L) {
+        val episodeId: Int? = pending.episode.id
+        if (episodeId == null) {
             Log.w(
                 TAG,
-                "Not saving episode=${pending.episode.id}: invalid duration " +
-                        "${update.durationMs}ms position=${update.positionMs}ms reason=${update.reason}"
+                "Cannot save progress: episode id is null for episode=${pending.episode.name ?: pending.episode.headerName}"
+            )
+            return false
+        }
+        if (update.durationMs < MIN_HISTORY_DURATION_MS) {
+            Log.w(
+                TAG,
+                "Cannot save progress episode=$episodeId: duration ${update.durationMs}ms is below ${MIN_HISTORY_DURATION_MS}ms minimum"
             )
             return false
         }
@@ -934,14 +943,14 @@ object ExternalPlaybackSessionStore {
             writer.write(pending, update)
             Log.d(
                 TAG,
-                "Saved external progress episode=${pending.episode.id} " +
+                "Saved external progress episode=$episodeId " +
                         "pos=${update.positionMs}/${update.durationMs} " +
                         "watched=${update.watchedContentMs} reason=${update.reason} " +
                         "completed=${update.completed}"
             )
             return true
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed to save external progress: ${t.message}")
+            Log.e(TAG, "Failed to save external progress episode=$episodeId: ${t.message}")
             return false
         }
     }

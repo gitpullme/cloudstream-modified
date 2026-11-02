@@ -82,15 +82,35 @@ object ExternalPlaybackMediaSessionTracker {
     private val controllers = mutableMapOf<String, MediaController>()
 
     /**
+     * Starts tracking from the launch path if notification listener access is
+     * granted. If access is missing, logs that condition and retains the pending
+     * launch marker so tracking can recover when access becomes available.
+     */
+    fun ensureStarted(context: Context, origin: String = "launch-path") {
+        val app = context.applicationContext
+        appContext = app
+        val accessGranted = hasNotificationAccess(app)
+        Log.d(TAG, "ensureStarted origin=$origin notificationAccess=$accessGranted running=$running")
+        if (!accessGranted) {
+            Log.w(
+                TAG,
+                "Notification listener access not granted; tracking retained and will recover after permission is granted"
+            )
+            return
+        }
+        start(app, origin)
+    }
+
+    /**
      * Starts or restarts tracking. Idempotent: calling start() on an already
      * running tracker triggers an immediate scan without creating duplicate
      * polling loops.
      */
-    fun start(context: Context) {
+    fun start(context: Context, origin: String = "service-connection") {
         val app = context.applicationContext
         appContext = app
         if (running) {
-            Log.d(TAG, "LISTENER_RECONNECTED: tracker already running, triggering scan")
+            Log.d(TAG, "LISTENER_RECONNECTED: tracker already running (origin=$origin), triggering scan")
             scan()
             return
         }
@@ -112,7 +132,7 @@ object ExternalPlaybackMediaSessionTracker {
         running = true
         Log.d(
             TAG,
-            "Tracker start manager=${manager != null} " +
+            "Tracker start origin=$origin manager=${manager != null} " +
                     "trackingEnabled=${ExternalPlaybackTrackingSettings.isEnabled(app)} " +
                     "notificationAccess=${hasNotificationAccess(app)}"
         )
@@ -247,7 +267,7 @@ object ExternalPlaybackMediaSessionTracker {
         activeToken = null
     }
 
-    private fun hasNotificationAccess(context: Context): Boolean {
+    fun hasNotificationAccess(context: Context): Boolean {
         return try {
             NotificationManagerCompat.getEnabledListenerPackages(context)
                 .contains(context.packageName)

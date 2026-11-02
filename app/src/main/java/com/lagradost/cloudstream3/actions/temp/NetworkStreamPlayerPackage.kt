@@ -73,6 +73,7 @@ class NetworkStreamPlayerPackage : OpenInAppAction(
             NetworkStreamPlayerLauncher.configureIntent(context, intent, request)
             pending = ExternalPlaybackSessionStore.begin(context, video, request, packageName)
             setKey("last_opened", video)
+            ExternalPlaybackMediaSessionTracker.ensureStarted(context, "launch-path")
             launchResult(intent)
         } catch (e: ActivityNotFoundException) {
             pending?.let { ExternalPlaybackSessionStore.abandon(it) }
