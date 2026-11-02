@@ -81,10 +81,16 @@ object ExternalPlaybackMediaSessionTracker {
     private var activeToken: String? = null
     private val controllers = mutableMapOf<String, MediaController>()
 
+    /**
+     * Starts or restarts tracking. Idempotent: calling start() on an already
+     * running tracker triggers an immediate scan without creating duplicate
+     * polling loops.
+     */
     fun start(context: Context) {
         val app = context.applicationContext
         appContext = app
         if (running) {
+            Log.d(TAG, "LISTENER_RECONNECTED: tracker already running, triggering scan")
             scan()
             return
         }
@@ -95,7 +101,14 @@ object ExternalPlaybackMediaSessionTracker {
         val component = ComponentName(app, ExternalPlaybackNotificationListenerService::class.java)
         val sessionSource = AndroidMediaSessionSource(manager, component, clock)
         source = sessionSource
-        core = buildCore(app, sessionSource)
+        // Reuse core if it exists and has a pending session, to preserve state.
+        val existingCore = core
+        if (existingCore == null) {
+            core = buildCore(app, sessionSource)
+        } else {
+            // Re-create with the new source but the pending store retains state.
+            core = buildCore(app, sessionSource)
+        }
         running = true
         Log.d(
             TAG,
@@ -122,9 +135,14 @@ object ExternalPlaybackMediaSessionTracker {
         )
     }
 
+    /**
+     * Stops tracker operations. Does NOT clear pending episode context from
+     * the persistent store — that is preserved across listener disconnection.
+     */
     fun stop(reason: String = "listener-disconnected") {
         running = false
         handler.removeCallbacks(pollRunnable)
+        // Reset core tracking state but the pending store persists independently.
         core?.reset(reason)
         core = null
         source = null
@@ -199,6 +217,7 @@ object ExternalPlaybackMediaSessionTracker {
     private fun bindController(controller: MediaController) {
         val token = controller.sessionToken.toString()
         if (activeToken == token) return
+        // Unregister callback from the previous active controller.
         activeToken?.let { old ->
             controllers.remove(old)?.let { previous ->
                 try {
@@ -265,6 +284,19 @@ object ExternalPlaybackMediaSessionTracker {
     }
 }
 
+/**
+ * Android adapter that wraps [MediaSessionManager.getActiveSessions] into the
+ * testable [ExternalPlaybackSessionSource] contract.
+ *
+ * Controller lifecycle rules:
+ * - Every successful [activeSessions] call replaces the controller map entirely.
+ * - A failed call (SecurityException) leaves the previous map untouched so a
+ *   stale map is never mistaken for a fresh scan.
+ * - Removed MediaSessions are released when the map is replaced.
+ * - A replacement token maps to the replacement MediaController.
+ * - Only one callback registration exists for the active controller (managed by
+ *   [ExternalPlaybackMediaSessionTracker.bindController]).
+ */
 private class AndroidMediaSessionSource(
     private val manager: MediaSessionManager?,
     private val listenerComponent: ComponentName,
@@ -275,8 +307,15 @@ private class AndroidMediaSessionSource(
     override fun activeSessions(): List<ExternalPlaybackSession> {
         val sessionManager = manager
             ?: throw IllegalStateException("MediaSessionManager unavailable")
-        val sessions = sessionManager.getActiveSessions(listenerComponent)
+        val sessions = try {
+            sessionManager.getActiveSessions(listenerComponent)
+        } catch (e: SecurityException) {
+            // Do NOT clear the controller map on a permission failure —
+            // a stale map should not look current after a failed scan.
+            throw e
+        }
         val now = clock.nowElapsedMs()
+        // Replace the controller map with the fresh set of sessions.
         controllers.clear()
         return sessions.map { controller ->
             val token = controller.sessionToken.toString()

@@ -144,6 +144,7 @@ class ExternalPlaybackProgressEngine(
     private val seekToleranceMs: Long = DEFAULT_SEEK_TOLERANCE_MS,
     private val resumeGuardMs: Long = DEFAULT_RESUME_GUARD_MS,
     private val unboundExpiryMs: Long = DEFAULT_UNBOUND_EXPIRY_MS,
+    private val candidateGraceMs: Long = DEFAULT_CANDIDATE_GRACE_MS,
 ) {
     companion object {
         const val DEFAULT_SAVE_INTERVAL_MS = 5_000L
@@ -153,6 +154,7 @@ class ExternalPlaybackProgressEngine(
         const val DEFAULT_SEEK_TOLERANCE_MS = 3_000L
         const val DEFAULT_RESUME_GUARD_MS = 5_000L
         const val DEFAULT_UNBOUND_EXPIRY_MS = 120_000L
+        const val DEFAULT_CANDIDATE_GRACE_MS = 60_000L
         const val COMPLETION_PERCENT = 95L
     }
 
@@ -201,6 +203,21 @@ class ExternalPlaybackProgressEngine(
 
     var titleMismatchDetected: Boolean = false
         private set
+
+    /**
+     * Timestamp when a candidate session was first seen but ambiguity prevented
+     * binding. While candidates are present the unbound expiry timer is extended
+     * by [candidateGraceMs] from this point. The timer still fires eventually
+     * so tracking cannot stay alive forever.
+     */
+    var candidateFirstSeenElapsedMs: Long? = null
+        private set
+
+    /**
+     * Whether the most recent scan found candidate sessions (ambiguous or not).
+     * Set externally by the tracker core after each scan.
+     */
+    var hasCandidates: Boolean = false
 
     private var lastObservedElapsedMs: Long? = null
     private var lastSpeed: Float = 1f
@@ -533,6 +550,24 @@ class ExternalPlaybackProgressEngine(
         if (boundSessionToken == null && !pending.hasObservedPlayback &&
             nowElapsedMs - pending.startedAtElapsedRealtimeMs >= unboundExpiryMs
         ) {
+            // If candidates are present (ambiguous), extend the grace period.
+            if (hasCandidates) {
+                val firstSeen = candidateFirstSeenElapsedMs
+                if (firstSeen == null) {
+                    // First time we notice candidates — record the timestamp.
+                    candidateFirstSeenElapsedMs = nowElapsedMs
+                    lastDecision = "waiting-ambiguous-candidates"
+                    return null
+                }
+                // Give ambiguous candidates a bounded resolution window.
+                if (nowElapsedMs - firstSeen < candidateGraceMs) {
+                    lastDecision = "waiting-ambiguous-candidates"
+                    return null
+                }
+                // Grace period exhausted — still ambiguous, expire.
+                lastDecision = "expired-unbound-ambiguous"
+                return ExternalPlaybackExpired
+            }
             lastDecision = "expired-unbound"
             return ExternalPlaybackExpired
         }
