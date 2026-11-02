@@ -181,9 +181,11 @@ object NetworkStreamPlayerLauncher {
         // 3. Playback Position.
         // Network Stream Player's verified intent contract has no position
         // extra. PlayerActivity only reads "position" from its saved-instance
-        // Bundle, not from Intent extras, and it never calls setResult. Do not
-        // pretend that resume is automatic; the saved position is preserved by
-        // the tracking layer and is not overwritten by a 0:00 start.
+        // Bundle, not from Intent extras, and it never calls setResult.
+        // Automatic resume is therefore performed by the MediaSession tracker:
+        // once the new session reports a valid duration and ACTION_SEEK_TO, it
+        // seeks once to the saved position. Until that seek is confirmed, the
+        // progress engine refuses to overwrite the saved position with 0:00.
 
         // 4. HTTP Headers. Direct playback never requires authentication context;
         // proxied playback keeps credentials inside the proxy process.

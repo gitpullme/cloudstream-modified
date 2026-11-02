@@ -37,10 +37,15 @@ data class PendingExternalPlayback(
     @SerialName("episode") val episode: ResultEpisode,
     /** Opaque hash of the stream URL; never the URL itself (it may contain tokens). */
     @SerialName("streamIdentifier") val streamIdentifier: String,
+    /** Position that may be resumed; 0 when the episode is completed/live. */
     @SerialName("initialPositionMs") val initialPositionMs: Long,
+    /** Last durable position, even when it must not be resumed. */
+    @SerialName("existingPositionMs") val existingPositionMs: Long = 0L,
     @SerialName("expectedDurationMs") val expectedDurationMs: Long,
     @SerialName("startedAtWallClockMs") val startedAtWallClockMs: Long,
     @SerialName("startedAtElapsedRealtimeMs") val startedAtElapsedRealtimeMs: Long,
+    /** Persisted so a process restart cannot issue the resume seek twice. */
+    @SerialName("resumeSeekAttempted") val resumeSeekAttempted: Boolean = false,
 )
 
 enum class ExternalPlaybackState {
@@ -66,6 +71,8 @@ data class ExternalPlaybackSnapshot(
     val positionMs: Long,
     val durationMs: Long,
     val speed: Float = 1f,
+    /** MediaSession.PlaybackState.actions (ACTION_SEEK_TO = 256). */
+    val actions: Long = 0L,
     /** MediaSession.PlaybackState.lastPositionUpdateTime (elapsedRealtime). */
     val lastPositionUpdateElapsedMs: Long = 0L,
     val observedAtElapsedMs: Long,
@@ -107,8 +114,9 @@ data object ExternalPlaybackExpired
  *    seeks and never counted as watched content;
  *  - a session is bound once and other tokens are ignored;
  *  - periodic writes are throttled; pause/stop/session loss are immediate;
- *  - a saved resume position is never overwritten by a player that starts at 0
- *    because this player does not implement the resume extra.
+ *  - a saved position is never overwritten by the 0:00 start this player uses
+ *    before the MediaSession resume seek is confirmed (or before enough genuine
+ *    viewing has accumulated when the seek is unsupported).
  */
 class ExternalPlaybackProgressEngine(
     private val pending: PendingExternalPlayback,
@@ -156,6 +164,9 @@ class ExternalPlaybackProgressEngine(
         private set
 
     var completed: Boolean = false
+        private set
+
+    var resumeSeekConfirmed: Boolean = false
         private set
 
     private var lastObservedElapsedMs: Long? = null
@@ -308,6 +319,15 @@ class ExternalPlaybackProgressEngine(
     }
 
     /**
+     * The MediaSession reported a position at or past the resume target after
+     * the seek request. From this point on, normal progress may overwrite the
+     * old saved position.
+     */
+    fun onResumeSeekConfirmed() {
+        resumeSeekConfirmed = true
+    }
+
+    /**
      * Called when no matching MediaSession is currently visible. The first call
      * saves the last known position immediately; later calls only start the
      * grace timer that eventually clears the pending launch marker.
@@ -441,18 +461,22 @@ class ExternalPlaybackProgressEngine(
     }
 
     /**
-     * Network Stream Player ignores the intent's position extra. If a saved
-     * position exists, do not overwrite it with the 0:00 position the player
-     * starts from. Once the user watches past the saved position, normal
-     * tracking resumes.
+     * Network Stream Player has no launch-position extra. Until the MediaSession
+     * seek is confirmed, do not overwrite a saved position with the 0:00 (or
+     * otherwise earlier) position the player starts from. This also protects a
+     * completed episode when the user restarts it externally.
+     *
+     * After a minute of genuine viewing the new position is accepted, so a user
+     * who intentionally restarts can still make progress even if the automatic
+     * seek was unsupported.
      */
     private fun mustPreserveResume(position: Long): Boolean {
-        if (pending.initialPositionMs < MIN_RESUME_GUARD_POSITION_MS) return false
-        // A short accidental 0:00 start must not erase a real resume point.
-        // After a minute of genuine viewing, accept the new position so a user
-        // who intentionally restarts can still make progress.
+        val existingPosition = maxOf(pending.existingPositionMs, pending.initialPositionMs)
+        if (existingPosition <= 0L) return false
+        if (resumeSeekConfirmed) return false
         if (watchedContentMs >= RESUME_OVERRIDE_WATCH_MS) return false
-        return position < pending.initialPositionMs - resumeGuardMs
+        val threshold = (existingPosition - resumeGuardMs).coerceAtLeast(1L)
+        return position < threshold
     }
 
     private fun titlesMatch(a: String, b: String): Boolean {
@@ -505,7 +529,6 @@ class ExternalPlaybackProgressEngine(
     }
 }
 
-private const val MIN_RESUME_GUARD_POSITION_MS = 30_000L
 private const val RESUME_OVERRIDE_WATCH_MS = 60_000L
 
 /**
@@ -532,6 +555,7 @@ object ExternalPlaybackSessionStore {
             episode = video,
             streamIdentifier = streamIdentifier(request),
             initialPositionMs = request.positionMs.coerceAtLeast(0L),
+            existingPositionMs = request.savedPositionMs.coerceAtLeast(0L),
             expectedDurationMs = video.duration.coerceAtLeast(0L),
             startedAtWallClockMs = System.currentTimeMillis(),
             startedAtElapsedRealtimeMs = SystemClock.elapsedRealtime(),
@@ -552,6 +576,21 @@ object ExternalPlaybackSessionStore {
             return null
         }
         return pending
+    }
+
+    /**
+     * Persist that the one permitted resume seek has been issued. If the
+     * process dies after this point the new tracker must not seek again.
+     * Returns null when the marker is gone or belongs to another launch.
+     */
+    fun markResumeSeekAttempted(pending: PendingExternalPlayback): PendingExternalPlayback? {
+        val current = get() ?: return null
+        if (current.sessionId != pending.sessionId) return null
+        if (current.resumeSeekAttempted) return current
+        val updated = current.copy(resumeSeekAttempted = true)
+        val appContext = CloudStreamApp.context ?: return null
+        appContext.setKey(PENDING_KEY, updated)
+        return updated
     }
 
     fun clear() {

@@ -59,6 +59,7 @@ object ExternalPlaybackMediaSessionTracker {
     private var sessionManager: MediaSessionManager? = null
     private var listenerComponent: ComponentName? = null
     private var engine: ExternalPlaybackProgressEngine? = null
+    private var resumeController: ExternalPlaybackResumeController? = null
     private var pendingSessionId: String? = null
     private var activeToken: String? = null
     private val controllers = mutableMapOf<String, MediaController>()
@@ -88,6 +89,7 @@ object ExternalPlaybackMediaSessionTracker {
         handler.removeCallbacks(pollRunnable)
         releaseControllers()
         engine = null
+        resumeController = null
         pendingSessionId = null
         sessionManager = null
         listenerComponent = null
@@ -189,11 +191,81 @@ object ExternalPlaybackMediaSessionTracker {
         val controller = chooseController(usable, tracker, pending)
         bindController(controller)
         val snapshot = snapshotOf(controller, now)
-        val update = tracker.onSnapshot(snapshot, now) ?: return
-        ExternalPlaybackSessionStore.saveProgress(pending, update)
-        if (update.clearPending) {
-            ExternalPlaybackSessionStore.clear()
-            resetEngine()
+        val update = tracker.onSnapshot(snapshot, now)
+        if (update != null) {
+            ExternalPlaybackSessionStore.saveProgress(pending, update)
+            if (update.clearPending) {
+                ExternalPlaybackSessionStore.clear()
+                resetEngine()
+                return
+            }
+        }
+        evaluateResumeSeek(controller, tracker, pending, snapshot, now)
+    }
+
+    /**
+     * Network Stream Player has no verified launch-position extra. Resume is
+     * performed through its MediaSession only after the session advertises a
+     * valid duration and ACTION_SEEK_TO. The seek is issued once and then
+     * confirmed by observing the reported position; failure is logged and never
+     * pauses playback.
+     */
+    private fun evaluateResumeSeek(
+        controller: MediaController,
+        tracker: ExternalPlaybackProgressEngine,
+        pending: PendingExternalPlayback,
+        snapshot: ExternalPlaybackSnapshot,
+        nowElapsedMs: Long,
+    ) {
+        val resume = resumeController ?: return
+        when (val action = resume.onSnapshot(snapshot, tracker.boundSessionToken, nowElapsedMs)) {
+            null -> return
+            is ExternalPlaybackResumeAction.SeekTo -> {
+                // Persist the one-shot flag before touching the player. If the
+                // process dies after this point, a restarted tracker must not
+                // seek again.
+                val marked = ExternalPlaybackSessionStore.markResumeSeekAttempted(pending)
+                if (marked == null) {
+                    resume.onSeekAborted()
+                    Log.w(TAG, "Resume seek aborted: pending session is no longer active")
+                    return
+                }
+                try {
+                    controller.transportControls.seekTo(action.positionMs)
+                    Log.d(
+                        TAG,
+                        "Resume seek requested episode=${pending.episode.id} " +
+                                "target=${action.positionMs}ms " +
+                                "position=${snapshot.positionMs}ms " +
+                                "duration=${snapshot.durationMs}ms actions=${snapshot.actions}"
+                    )
+                } catch (t: Throwable) {
+                    resume.onSeekCommandFailed()
+                    Log.w(
+                        TAG,
+                        "Resume seek failed episode=${pending.episode.id} " +
+                                "target=${action.positionMs}ms: ${t.message}"
+                    )
+                }
+            }
+
+            ExternalPlaybackResumeAction.Confirmed -> {
+                tracker.onResumeSeekConfirmed()
+                Log.d(
+                    TAG,
+                    "Resume position confirmed episode=${pending.episode.id} " +
+                            "target=${pending.initialPositionMs}ms " +
+                            "reported=${resume.confirmedPositionMs}ms"
+                )
+            }
+
+            ExternalPlaybackResumeAction.Failed -> {
+                Log.w(
+                    TAG,
+                    "Automatic resume unavailable episode=${pending.episode.id} " +
+                            "target=${pending.initialPositionMs}ms state=${resume.state}"
+                )
+            }
         }
     }
 
@@ -202,12 +274,16 @@ object ExternalPlaybackMediaSessionTracker {
         if (current != null && pendingSessionId == pending.sessionId) return current
         resetEngine()
         pendingSessionId = pending.sessionId
-        return ExternalPlaybackProgressEngine(pending).also { engine = it }
+        return ExternalPlaybackProgressEngine(pending).also {
+            engine = it
+            resumeController = ExternalPlaybackResumeController(pending)
+        }
     }
 
     private fun resetEngine() {
         releaseControllers()
         engine = null
+        resumeController = null
         pendingSessionId = null
     }
 
@@ -283,6 +359,7 @@ object ExternalPlaybackMediaSessionTracker {
             positionMs = state?.position ?: 0L,
             durationMs = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L,
             speed = state?.playbackSpeed ?: 1f,
+            actions = state?.actions ?: 0L,
             lastPositionUpdateElapsedMs = state?.lastPositionUpdateTime ?: 0L,
             observedAtElapsedMs = now,
             title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)

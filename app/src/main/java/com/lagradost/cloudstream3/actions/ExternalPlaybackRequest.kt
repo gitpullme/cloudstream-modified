@@ -3,12 +3,14 @@ package com.lagradost.cloudstream3.actions
 import android.content.Context
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
 import com.lagradost.cloudstream3.USER_AGENT
+import com.lagradost.cloudstream3.isLiveStream
 import com.lagradost.cloudstream3.ui.player.SubtitleData
 import com.lagradost.cloudstream3.ui.player.SubtitleOrigin
 import com.lagradost.cloudstream3.ui.result.LinkLoadingResult
 import com.lagradost.cloudstream3.ui.result.ResultEpisode
 import com.lagradost.cloudstream3.ui.subtitles.SUBTITLE_AUTO_SELECT_KEY
 import com.lagradost.cloudstream3.utils.CLEARKEY_DRM_UUID
+import com.lagradost.cloudstream3.utils.DataStoreHelper.getVideoWatchState
 import com.lagradost.cloudstream3.utils.DataStoreHelper.getViewPos
 import com.lagradost.cloudstream3.utils.DrmExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -62,7 +64,10 @@ data class ExternalPlaybackRequest(
     val drmHeaders: Map<String, String> = emptyMap(),
     val subtitles: List<ExternalSubtitle> = emptyList(),
     val selectedSubtitle: ExternalSubtitle? = null,
+    /** Verified resume target; 0 when playback must start at the beginning. */
     val positionMs: Long = 0L,
+    /** Last durable position, retained even when it must not be resumed. */
+    val savedPositionMs: Long = 0L,
     val isDrm: Boolean = false,
     val rawExtractorLink: ExtractorLink? = null,
     val masterUrl: String? = null,
@@ -264,7 +269,16 @@ object ExternalPlaybackRequestBuilder {
             }
         }
 
-        val position = getViewPos(video.id)?.position ?: 0L
+        val savedPosDur = getViewPos(video.id)
+        val savedPosition = savedPosDur?.position?.coerceAtLeast(0L) ?: 0L
+        val savedDuration = savedPosDur?.duration?.takeIf { it > 0L } ?: video.duration
+        val watchState = getVideoWatchState(video.id) ?: video.videoWatchState
+        val resumePosition = ExternalPlaybackResumePolicy.resolveResumePositionMs(
+            savedPositionMs = savedPosition,
+            savedDurationMs = savedDuration,
+            isLive = video.tvType.isLiveStream(),
+            watchState = watchState,
+        )
         val title = video.name ?: video.headerName
 
         return ExternalPlaybackRequest(
@@ -284,7 +298,8 @@ object ExternalPlaybackRequestBuilder {
             drmHeaders = drmHeaders,
             subtitles = subtitles,
             selectedSubtitle = selectedSubtitle,
-            positionMs = position,
+            positionMs = resumePosition,
+            savedPositionMs = savedPosition,
             isDrm = isDrm,
             rawExtractorLink = link,
             masterUrl = masterUrl,

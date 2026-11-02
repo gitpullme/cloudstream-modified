@@ -2,6 +2,10 @@ package com.lagradost.cloudstream3
 
 import com.lagradost.cloudstream3.actions.ExternalPlaybackExpired
 import com.lagradost.cloudstream3.actions.ExternalPlaybackProgressEngine
+import com.lagradost.cloudstream3.actions.ExternalPlaybackResumeAction
+import com.lagradost.cloudstream3.actions.ExternalPlaybackResumeController
+import com.lagradost.cloudstream3.actions.ExternalPlaybackResumePolicy
+import com.lagradost.cloudstream3.actions.ExternalPlaybackResumeState
 import com.lagradost.cloudstream3.actions.ExternalPlaybackSaveReason
 import com.lagradost.cloudstream3.actions.ExternalPlaybackSnapshot
 import com.lagradost.cloudstream3.actions.ExternalPlaybackState
@@ -32,6 +36,7 @@ class ExternalPlaybackTrackingTest {
         id: Int = 12345,
         name: String = "Test Movie",
         duration: Long = DURATION,
+        tvType: TvType = TvType.Movie,
     ): ResultEpisode {
         return ResultEpisode(
             headerName = "Test Show",
@@ -49,7 +54,7 @@ class ExternalPlaybackTrackingTest {
             score = null,
             description = "Test description",
             isFiller = false,
-            tvType = TvType.Movie,
+            tvType = tvType,
             parentId = 123,
             videoWatchState = VideoWatchState.None,
         )
@@ -57,18 +62,23 @@ class ExternalPlaybackTrackingTest {
 
     private fun pending(
         initialPositionMs: Long = 0L,
+        existingPositionMs: Long = initialPositionMs,
         expectedDurationMs: Long = DURATION,
         name: String = "Test Movie",
+        resumeSeekAttempted: Boolean = false,
+        tvType: TvType = TvType.Movie,
     ): PendingExternalPlayback {
         return PendingExternalPlayback(
             sessionId = "pending-1",
             packageName = PACKAGE,
-            episode = episode(name = name, duration = expectedDurationMs),
+            episode = episode(name = name, duration = expectedDurationMs, tvType = tvType),
             streamIdentifier = "abc123",
             initialPositionMs = initialPositionMs,
+            existingPositionMs = existingPositionMs,
             expectedDurationMs = expectedDurationMs,
             startedAtWallClockMs = 1_000L,
             startedAtElapsedRealtimeMs = START,
+            resumeSeekAttempted = resumeSeekAttempted,
         )
     }
 
@@ -77,6 +87,7 @@ class ExternalPlaybackTrackingTest {
         positionMs: Long,
         durationMs: Long = DURATION,
         speed: Float = 1f,
+        actions: Long = ExternalPlaybackResumeController.ACTION_SEEK_TO,
         observedAtElapsedMs: Long,
         lastPositionUpdateElapsedMs: Long = observedAtElapsedMs,
         sessionToken: String = TOKEN,
@@ -90,6 +101,7 @@ class ExternalPlaybackTrackingTest {
             positionMs = positionMs,
             durationMs = durationMs,
             speed = speed,
+            actions = actions,
             lastPositionUpdateElapsedMs = lastPositionUpdateElapsedMs,
             observedAtElapsedMs = observedAtElapsedMs,
             title = title,
@@ -557,5 +569,467 @@ class ExternalPlaybackTrackingTest {
         assertNotNull(update)
         assertEquals(ExternalPlaybackSaveReason.PERIODIC, update!!.reason)
         assertFalse(update.clearPending)
+    }
+
+    @Test
+    fun `resume policy accepts an incomplete VOD position`() {
+        assertEquals(
+            60_000L,
+            ExternalPlaybackResumePolicy.resolveResumePositionMs(
+                savedPositionMs = 60_000L,
+                savedDurationMs = DURATION,
+                isLive = false,
+                watchState = VideoWatchState.None,
+            )
+        )
+    }
+
+    @Test
+    fun `resume policy rejects completed watched live and invalid positions`() {
+        assertEquals(
+            0L,
+            ExternalPlaybackResumePolicy.resolveResumePositionMs(
+                savedPositionMs = 0L,
+                savedDurationMs = DURATION,
+                isLive = false,
+                watchState = VideoWatchState.None,
+            )
+        )
+        assertEquals(
+            0L,
+            ExternalPlaybackResumePolicy.resolveResumePositionMs(
+                savedPositionMs = 60_000L,
+                savedDurationMs = 0L,
+                isLive = false,
+                watchState = VideoWatchState.None,
+            )
+        )
+        assertEquals(
+            0L,
+            ExternalPlaybackResumePolicy.resolveResumePositionMs(
+                savedPositionMs = 60_000L,
+                savedDurationMs = DURATION,
+                isLive = true,
+                watchState = VideoWatchState.None,
+            )
+        )
+        assertEquals(
+            0L,
+            ExternalPlaybackResumePolicy.resolveResumePositionMs(
+                savedPositionMs = 60_000L,
+                savedDurationMs = DURATION,
+                isLive = false,
+                watchState = VideoWatchState.Watched,
+            )
+        )
+        assertEquals(
+            0L,
+            ExternalPlaybackResumePolicy.resolveResumePositionMs(
+                savedPositionMs = 95_000L,
+                savedDurationMs = DURATION,
+                isLive = false,
+                watchState = VideoWatchState.None,
+            )
+        )
+        assertEquals(
+            0L,
+            ExternalPlaybackResumePolicy.resolveResumePositionMs(
+                savedPositionMs = DURATION,
+                savedDurationMs = DURATION,
+                isLive = false,
+                watchState = VideoWatchState.None,
+            )
+        )
+    }
+
+    @Test
+    fun `resume seek waits for a valid duration before issuing the command`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 60_000L))
+
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    durationMs = 0L,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            )
+        )
+        assertEquals(ExternalPlaybackResumeState.WAITING_FOR_MEDIA, controller.state)
+
+        val action = controller.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 1_000L,
+                observedAtElapsedMs = at(2),
+            ),
+            TOKEN,
+            at(2),
+        )
+
+        assertTrue(action is ExternalPlaybackResumeAction.SeekTo)
+        assertEquals(60_000L, (action as ExternalPlaybackResumeAction.SeekTo).positionMs)
+        assertEquals(60_000L, controller.lastRequestedPositionMs)
+        assertEquals(ExternalPlaybackResumeState.SEEK_REQUESTED, controller.state)
+    }
+
+    @Test
+    fun `resume seek ignores other packages and session tokens`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 60_000L))
+
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                    packageName = "com.example.other",
+                ),
+                TOKEN,
+                at(1),
+            )
+        )
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(2),
+                    sessionToken = "another-token",
+                ),
+                TOKEN,
+                at(2),
+            )
+        )
+        assertEquals(ExternalPlaybackResumeState.WAITING_FOR_MEDIA, controller.state)
+
+        val action = controller.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(3),
+            ),
+            TOKEN,
+            at(3),
+        )
+        assertTrue(action is ExternalPlaybackResumeAction.SeekTo)
+    }
+
+    @Test
+    fun `resume seek is not issued when ACTION_SEEK_TO is missing`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 60_000L))
+
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    actions = 0L,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            )
+        )
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 5_000L,
+                    actions = 0L,
+                    observedAtElapsedMs = at(15),
+                ),
+                TOKEN,
+                at(15),
+            )
+        )
+
+        val failed = controller.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 10_000L,
+                actions = 0L,
+                observedAtElapsedMs = at(16),
+            ),
+            TOKEN,
+            at(16),
+        )
+
+        assertEquals(ExternalPlaybackResumeAction.Failed, failed)
+        assertEquals(ExternalPlaybackResumeState.FAILED, controller.state)
+        assertNull(controller.lastRequestedPositionMs)
+    }
+
+    @Test
+    fun `resume seek is issued once and confirmed by the reported position`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 60_000L))
+
+        val seek = controller.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 0L,
+                observedAtElapsedMs = at(1),
+            ),
+            TOKEN,
+            at(1),
+        )
+        assertTrue(seek is ExternalPlaybackResumeAction.SeekTo)
+
+        val confirmed = controller.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 60_500L,
+                observedAtElapsedMs = at(6),
+            ),
+            TOKEN,
+            at(6),
+        )
+
+        assertEquals(ExternalPlaybackResumeAction.Confirmed, confirmed)
+        assertEquals(ExternalPlaybackResumeState.CONFIRMED, controller.state)
+        assertEquals(60_500L, controller.confirmedPositionMs)
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 65_000L,
+                    observedAtElapsedMs = at(11),
+                ),
+                TOKEN,
+                at(11),
+            )
+        )
+    }
+
+    @Test
+    fun `ignored resume seek fails without retrying`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 60_000L))
+
+        assertTrue(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            ) is ExternalPlaybackResumeAction.SeekTo
+        )
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 5_000L,
+                    observedAtElapsedMs = at(6),
+                ),
+                TOKEN,
+                at(6),
+            )
+        )
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 10_000L,
+                    observedAtElapsedMs = at(11),
+                ),
+                TOKEN,
+                at(11),
+            )
+        )
+
+        assertEquals(
+            ExternalPlaybackResumeAction.Failed,
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 15_000L,
+                    observedAtElapsedMs = at(16),
+                ),
+                TOKEN,
+                at(16),
+            )
+        )
+        assertEquals(ExternalPlaybackResumeState.FAILED, controller.state)
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 20_000L,
+                    observedAtElapsedMs = at(21),
+                ),
+                TOKEN,
+                at(21),
+            )
+        )
+    }
+
+    @Test
+    fun `resume seek command failure never retries`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 60_000L))
+
+        assertTrue(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            ) is ExternalPlaybackResumeAction.SeekTo
+        )
+        controller.onSeekCommandFailed()
+
+        assertEquals(ExternalPlaybackResumeState.FAILED, controller.state)
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(6),
+                ),
+                TOKEN,
+                at(6),
+            )
+        )
+    }
+
+    @Test
+    fun `resume seek never goes beyond the media duration`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 120_000L))
+
+        assertEquals(
+            ExternalPlaybackResumeAction.Failed,
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    durationMs = DURATION,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            )
+        )
+        assertEquals(ExternalPlaybackResumeState.FAILED, controller.state)
+    }
+
+    @Test
+    fun `resume seek does not move backwards when playback is already past the target`() {
+        val controller = ExternalPlaybackResumeController(pending(initialPositionMs = 60_000L))
+
+        assertEquals(
+            ExternalPlaybackResumeAction.Confirmed,
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 80_000L,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            )
+        )
+        assertEquals(ExternalPlaybackResumeState.CONFIRMED, controller.state)
+        assertEquals(80_000L, controller.confirmedPositionMs)
+        assertNull(controller.lastRequestedPositionMs)
+    }
+
+    @Test
+    fun `resume seek is skipped for live episodes`() {
+        val controller = ExternalPlaybackResumeController(
+            pending(initialPositionMs = 60_000L, tvType = TvType.Live)
+        )
+
+        assertEquals(
+            ExternalPlaybackResumeAction.Failed,
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            )
+        )
+        assertEquals(ExternalPlaybackResumeState.FAILED, controller.state)
+    }
+
+    @Test
+    fun `persisted resume attempt prevents a second seek after process restart`() {
+        val controller = ExternalPlaybackResumeController(
+            pending(initialPositionMs = 60_000L, resumeSeekAttempted = true)
+        )
+
+        assertEquals(ExternalPlaybackResumeState.ALREADY_ATTEMPTED, controller.state)
+        assertNull(
+            controller.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 0L,
+                    observedAtElapsedMs = at(1),
+                ),
+                TOKEN,
+                at(1),
+            )
+        )
+    }
+
+    @Test
+    fun `engine saves normally after the resume seek is confirmed`() {
+        val engine = ExternalPlaybackProgressEngine(pending(initialPositionMs = 60_000L))
+        bind(engine, positionMs = 0L)
+        engine.onResumeSeekConfirmed()
+
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 60_000L,
+                observedAtElapsedMs = at(6),
+            )
+        )
+
+        assertNotNull(update)
+        assertEquals(60_000L, update!!.positionMs)
+    }
+
+    @Test
+    fun `engine preserves a completed episode position when playback starts at zero`() {
+        val engine = ExternalPlaybackProgressEngine(
+            pending(initialPositionMs = 0L, existingPositionMs = 96_000L)
+        )
+        bind(engine, positionMs = 0L)
+
+        assertNull(
+            engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = 5_000L,
+                    observedAtElapsedMs = at(6),
+                )
+            )
+        )
+        assertEquals(-1L, engine.lastPersistedPositionMs)
+
+        var lastUpdate: com.lagradost.cloudstream3.actions.ExternalPlaybackUpdate? = null
+        for (seconds in 11L..61L step 5L) {
+            lastUpdate = engine.onSnapshot(
+                snapshot(
+                    state = ExternalPlaybackState.PLAYING,
+                    positionMs = (seconds - 1L) * 1_000L,
+                    observedAtElapsedMs = at(seconds),
+                )
+            )
+            if (seconds < 61L) assertNull(lastUpdate)
+        }
+
+        assertNotNull(lastUpdate)
+        assertEquals(60_000L, lastUpdate!!.positionMs)
     }
 }

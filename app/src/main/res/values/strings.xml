@@ -832,7 +832,7 @@
     <string name="player_err_drm_unsupported">DRM format not supported by external player</string>
     <string name="external_player_tracking_category">External player</string>
     <string name="external_player_tracking">Track external player progress</string>
-    <string name="external_player_tracking_description">Save watch progress from Network Stream Player using its media session. Requires notification access.</string>
+    <string name="external_player_tracking_description">Save watch progress and resume Network Stream Player using its media session. Requires notification access.</string>
     <string name="external_player_notification_access">Notification access</string>
     <string name="external_player_notification_access_granted">Granted. Progress can be read while Network Stream Player is playing.</string>
     <string name="external_player_notification_access_denied">Not granted. Tap to open Android notification access settings.</string>
