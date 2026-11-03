@@ -27,9 +27,11 @@ import com.lagradost.cloudstream3.utils.WIDEVINE_DRM_UUID
 import com.sun.net.httpserver.HttpServer
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -2693,6 +2695,318 @@ class NetworkStreamPlayerIntegrationTest {
             assertTrue(LocalStreamProxyServer.ensureStarted() > 0)
         } finally {
             session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    private class CountingOutputStream(private val target: OutputStream) : OutputStream() {
+        var writeCalls = 0
+        var flushCalls = 0
+        var bytesWritten = 0L
+
+        override fun write(b: Int) {
+            writeCalls++
+            bytesWritten++
+            target.write(b)
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            if (len > 0) {
+                writeCalls++
+                bytesWritten += len
+                target.write(b, off, len)
+            }
+        }
+
+        override fun flush() {
+            flushCalls++
+            target.flush()
+        }
+
+        override fun close() {
+            target.close()
+        }
+    }
+
+    @Test
+    fun `streaming latency - initial media block is received promptly without waiting for subsequent blocks or buffer fill`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val firstBlockData = ByteArray(256) { 0x11.toByte() }
+        val secondBlockData = ByteArray(768) { 0x22.toByte() }
+
+        server.createContext("/latency/stream.ts") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "video/mp2t")
+            exchange.sendResponseHeaders(200, 1024L)
+            val os = exchange.responseBody
+            os.write(firstBlockData)
+            os.flush()
+            Thread.sleep(300)
+            os.write(secondBlockData)
+            os.flush()
+            os.close()
+        }
+        server.start()
+        LocalStreamProxyServer.resetForTest()
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/latency/stream.ts"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream))
+            LocalStreamProxyServer.ensureStarted()
+
+            val resId = session.registerResource(upstream, type = LocalStreamProxyServer.ResourceType.SEGMENT)
+            val proxyUrl = "http://127.0.0.1:${LocalStreamProxyServer.port}/session/${session.sessionId}/res/$resId.ts"
+
+            val conn = openConnection(proxyUrl)
+            assertEquals(200, conn.responseCode)
+            val inStream = conn.inputStream
+
+            val t0 = System.currentTimeMillis()
+            val receivedFirst = ByteArray(256)
+            var readTotal = 0
+            while (readTotal < 256) {
+                val n = inStream.read(receivedFirst, readTotal, 256 - readTotal)
+                if (n == -1) break
+                readTotal += n
+            }
+            val elapsed = System.currentTimeMillis() - t0
+
+            assertEquals(256, readTotal)
+            assertArrayEquals(firstBlockData, receivedFirst)
+            assertTrue(
+                "Initial block must arrive promptly without waiting for the delayed remainder, elapsed was ${elapsed}ms",
+                elapsed < 200
+            )
+
+            val remaining = inStream.readBytes()
+            assertEquals(768, remaining.size)
+            assertArrayEquals(secondBlockData, remaining)
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `BufferedClientOutputStream coalesces small writes and supports direct write-through`() {
+        val rawByteOutput = ByteArrayOutputStream()
+        val countingStream = CountingOutputStream(rawByteOutput)
+        val buffered = LocalStreamProxyServer.BufferedClientOutputStream(countingStream, 64 * 1024)
+
+        val smallChunk = ByteArray(1024) { (it % 127).toByte() }
+        for (i in 0 until 10) {
+            buffered.write(smallChunk)
+        }
+        // Writes are buffered in memory: target has not received any writes yet
+        assertEquals(10240, buffered.bufferedBytes)
+        assertEquals(0, countingStream.writeCalls)
+
+        // Manual or adaptive flush commits buffered bytes to target in a single batch
+        buffered.flush()
+        assertEquals(1, countingStream.writeCalls)
+        assertEquals(10240L, countingStream.bytesWritten)
+        assertEquals(0, buffered.bufferedBytes)
+
+        // Direct write >= buffer size (64 KB) writes through directly without copying into internal buffer
+        val directBlock = ByteArray(64 * 1024) { (it % 251).toByte() }
+        buffered.write(directBlock)
+        assertEquals(2, countingStream.writeCalls)
+        assertEquals(10240L + 64 * 1024, countingStream.bytesWritten)
+
+        buffered.close()
+        val writtenBytes = rawByteOutput.toByteArray()
+        assertEquals(10240 + 64 * 1024, writtenBytes.size)
+
+        // Verify byte-for-byte data integrity
+        for (i in 0 until 10) {
+            val slice = writtenBytes.copyOfRange(i * 1024, (i + 1) * 1024)
+            assertArrayEquals(smallChunk, slice)
+        }
+        val directSlice = writtenBytes.copyOfRange(10240, 10240 + 64 * 1024)
+        assertArrayEquals(directBlock, directSlice)
+    }
+
+    @Test
+    fun `large media response of 16MB transfers with exact SHA-256 integrity and low memory overhead`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val totalMediaBytes = 16 * 1024 * 1024 // 16 MB
+        val blockPattern = ByteArray(64 * 1024) { (it % 256).toByte() }
+
+        // Compute upstream SHA-256
+        val upstreamDigest = MessageDigest.getInstance("SHA-256")
+        var generated = 0
+        while (generated < totalMediaBytes) {
+            upstreamDigest.update(blockPattern)
+            generated += blockPattern.size
+        }
+        val upstreamHash = upstreamDigest.digest().joinToString("") { "%02x".format(it) }
+
+        server.createContext("/media/large_video.mp4") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "video/mp4")
+            exchange.sendResponseHeaders(200, totalMediaBytes.toLong())
+            val os = exchange.responseBody
+            var sent = 0
+            while (sent < totalMediaBytes) {
+                os.write(blockPattern)
+                sent += blockPattern.size
+            }
+            os.close()
+        }
+        server.start()
+
+        LocalStreamProxyServer.resetForTest()
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/media/large_video.mp4"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            LocalStreamProxyServer.ensureStarted()
+
+            val resId = session.registerResource(upstream, type = LocalStreamProxyServer.ResourceType.SEGMENT)
+            val proxyUrl = "http://127.0.0.1:${LocalStreamProxyServer.port}/session/${session.sessionId}/res/$resId.mp4"
+
+            val conn = openConnection(proxyUrl)
+            assertEquals(200, conn.responseCode)
+            assertEquals(totalMediaBytes.toLong(), conn.contentLengthLong)
+
+            val clientDigest = MessageDigest.getInstance("SHA-256")
+            val readBuf = ByteArray(64 * 1024)
+            var totalRead = 0L
+            conn.inputStream.use { inStream ->
+                while (true) {
+                    val n = inStream.read(readBuf)
+                    if (n == -1) break
+                    clientDigest.update(readBuf, 0, n)
+                    totalRead += n
+                }
+            }
+
+            assertEquals(totalMediaBytes.toLong(), totalRead)
+            val clientHash = clientDigest.digest().joinToString("") { "%02x".format(it) }
+            assertEquals("SHA-256 hash of 16MB stream must match upstream exactly", upstreamHash, clientHash)
+            assertTrue(
+                "Total transferred telemetry should record full stream",
+                LocalStreamProxyServer.totalBytesTransferred.get() >= totalMediaBytes.toLong()
+            )
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `HLS inspection is bypassed for known binary resources but preserved for playlists and unknown resources`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+
+        server.createContext("/hls/master.m3u8") { exchange ->
+            val bytes = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nmedia.m3u8\n".toByteArray()
+            exchange.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.responseBody.close()
+        }
+
+        server.createContext("/hls/media.m3u8") { exchange ->
+            val bytes = ("#EXTM3U\n#EXT-X-TARGETDURATION:4\n" +
+                    "#EXT-X-KEY:METHOD=AES-128,URI=\"enc.key\"\n" +
+                    "#EXTINF:4.0,\nseg1.ts\n#EXT-X-ENDLIST\n").toByteArray()
+            exchange.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.responseBody.close()
+        }
+
+        val keyBytes = ByteArray(16) { 0x55.toByte() }
+        server.createContext("/hls/enc.key") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "application/octet-stream")
+            exchange.sendResponseHeaders(200, keyBytes.size.toLong())
+            exchange.responseBody.write(keyBytes)
+            exchange.responseBody.close()
+        }
+
+        val segBytes = ByteArray(4096) { 0x47.toByte() }
+        server.createContext("/hls/seg1.ts") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "video/mp2t")
+            exchange.sendResponseHeaders(200, segBytes.size.toLong())
+            exchange.responseBody.write(segBytes)
+            exchange.responseBody.close()
+        }
+
+        val unknownBytes = "Some arbitrary data".toByteArray()
+        server.createContext("/hls/unknown.dat") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "application/octet-stream")
+            exchange.sendResponseHeaders(200, unknownBytes.size.toLong())
+            exchange.responseBody.write(unknownBytes)
+            exchange.responseBody.close()
+        }
+
+        server.start()
+
+        LocalStreamProxyServer.resetForTest()
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/hls/master.m3u8"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream))
+            LocalStreamProxyServer.ensureStarted()
+
+            // 1. Fetch master playlist -> must perform HLS inspection
+            val masterConn = openConnection(LocalStreamProxyServer.createStreamUrl(session))
+            assertEquals(200, masterConn.responseCode)
+            val rewrittenMaster = masterConn.inputStream.bufferedReader().readText()
+            val masterInspections = LocalStreamProxyServer.hlsInspectionCount.get()
+            assertTrue("Master playlist should be inspected for HLS", masterInspections > 0)
+
+            // 2. Fetch media playlist -> must perform HLS inspection
+            val mediaUrl = rewrittenMaster.lines().first { it.contains("/res/") && it.endsWith(".m3u8") }.trim()
+            val mediaConn = openConnection(mediaUrl)
+            assertEquals(200, mediaConn.responseCode)
+            val rewrittenMedia = mediaConn.inputStream.bufferedReader().readText()
+            val mediaInspections = LocalStreamProxyServer.hlsInspectionCount.get()
+            assertTrue("Media playlist should be inspected for HLS", mediaInspections > masterInspections)
+
+            // Record baseline inspection count before accessing binary resources
+            val countBeforeBinary = LocalStreamProxyServer.hlsInspectionCount.get()
+
+            // 3. Fetch TS segment -> known binary resource (SEGMENT), inspection must be bypassed!
+            val segmentUrl = rewrittenMedia.lines().first { it.contains("/res/") && it.endsWith(".ts") }.trim()
+            val segConn = openConnection(segmentUrl)
+            assertEquals(200, segConn.responseCode)
+            assertArrayEquals(segBytes, readAllBytes(segConn))
+            assertEquals(
+                "Known SEGMENT resource must bypass checkIsHls() sniffing",
+                countBeforeBinary,
+                LocalStreamProxyServer.hlsInspectionCount.get()
+            )
+
+            // 4. Fetch encryption key -> known binary resource (KEY), inspection must be bypassed!
+            val keyUrl = rewrittenMedia.lines().first { it.contains("URI=\"") }
+                .substringAfter("URI=\"").substringBefore("\"")
+            val keyConn = openConnection(keyUrl)
+            assertEquals(200, keyConn.responseCode)
+            assertArrayEquals(keyBytes, readAllBytes(keyConn))
+            assertEquals(
+                "Known KEY resource must bypass checkIsHls() sniffing",
+                countBeforeBinary,
+                LocalStreamProxyServer.hlsInspectionCount.get()
+            )
+
+            // 5. Fetch an unknown resource with ResourceType.OTHER -> must perform HLS inspection
+            val unknownUpstream = "http://127.0.0.1:$serverPort/hls/unknown.dat"
+            val unknownResId = session.registerResource(unknownUpstream, type = LocalStreamProxyServer.ResourceType.OTHER)
+            val unknownProxyUrl = "http://127.0.0.1:${LocalStreamProxyServer.port}/session/${session.sessionId}/res/$unknownResId"
+            val unknownConn = openConnection(unknownProxyUrl)
+            assertEquals(200, unknownConn.responseCode)
+            assertArrayEquals(unknownBytes, readAllBytes(unknownConn))
+            assertTrue(
+                "Unknown resource must be inspected for HLS",
+                LocalStreamProxyServer.hlsInspectionCount.get() > countBeforeBinary
+            )
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
             LocalStreamProxyServer.resetForTest()
         }
     }

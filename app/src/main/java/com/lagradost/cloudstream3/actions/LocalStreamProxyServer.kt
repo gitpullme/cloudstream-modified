@@ -52,7 +52,11 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object LocalStreamProxyServer : Closeable {
     private const val TAG = "LocalStreamProxy"
-    private const val BUFFER_SIZE = 32 * 1024 // 32 KB bounded streaming buffer
+    const val BUFFER_SIZE = 64 * 1024
+    const val DEFAULT_CLIENT_BUFFER_SIZE = 64 * 1024 // 64 KB per-client buffered socket output stream
+    const val BATCH_FLUSH_THRESHOLD = 32 * 1024 // 32 KB write coalescing threshold
+    const val TRANSFER_BUFFER_SIZE = 64 * 1024 // 64 KB reusable media transfer buffer
+    const val TELEMETRY_LOG_INTERVAL = 50L // Emit aggregated stats every 50 completed requests
     private const val MAX_CONNECTIONS = 64
     private const val MAX_PENDING_CONNECTIONS = 64
     private const val MAX_REDIRECTS = 8
@@ -62,6 +66,26 @@ object LocalStreamProxyServer : Closeable {
 
     const val DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000L // 15 minutes of inactivity
     const val DEFAULT_TTL_MS = 4 * 60 * 60 * 1000L // 4 hours maximum session validity
+
+    @Volatile var verboseDiagnostics: Boolean = false
+    val totalCompletedRequests = AtomicLong(0)
+    val totalBytesTransferred = AtomicLong(0)
+    val activeTransfers = AtomicInteger(0)
+    val totalTransferFailures = AtomicLong(0)
+    val hlsInspectionCount = AtomicLong(0)
+
+    private val threadLocalTransferBuffer = ThreadLocal.withInitial {
+        ByteArray(TRANSFER_BUFFER_SIZE)
+    }
+
+    private fun getTransferBuffer(): ByteArray {
+        return threadLocalTransferBuffer.get() ?: ByteArray(TRANSFER_BUFFER_SIZE).also {
+            threadLocalTransferBuffer.set(it)
+        }
+    }
+
+    private val CRLF = byteArrayOf('\r'.code.toByte(), '\n'.code.toByte())
+    private val ZERO_CHUNK = "0\r\n\r\n".toByteArray(Charsets.US_ASCII)
 
     private val isRunning = AtomicBoolean(false)
     @Volatile private var serverSocket: ServerSocket? = null
@@ -81,6 +105,66 @@ object LocalStreamProxyServer : Closeable {
 
     private val sessions = ConcurrentHashMap<String, ProxySession>()
     private val requestSeq = AtomicLong(0)
+
+    /**
+     * Bounded, per-client buffered socket output stream.
+     * Coalesces small socket writes into batches up to 64 KB while providing direct
+     * write-through for large buffers and manual/adaptive flush control.
+     */
+    class BufferedClientOutputStream(
+        val target: OutputStream,
+        bufferSize: Int = DEFAULT_CLIENT_BUFFER_SIZE
+    ) : OutputStream() {
+        private val buf = ByteArray(bufferSize)
+        private var count = 0
+
+        val bufferedBytes: Int
+            get() = count
+
+        val capacity: Int
+            get() = buf.size
+
+        override fun write(b: Int) {
+            if (count >= buf.size) {
+                flushBuffer()
+            }
+            buf[count++] = b.toByte()
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            if (len <= 0) return
+            if (len >= buf.size) {
+                flushBuffer()
+                target.write(b, off, len)
+                return
+            }
+            if (count + len > buf.size) {
+                flushBuffer()
+            }
+            System.arraycopy(b, off, buf, count, len)
+            count += len
+        }
+
+        fun flushBuffer() {
+            if (count > 0) {
+                target.write(buf, 0, count)
+                count = 0
+            }
+        }
+
+        override fun flush() {
+            flushBuffer()
+            target.flush()
+        }
+
+        override fun close() {
+            try {
+                flush()
+            } finally {
+                target.close()
+            }
+        }
+    }
 
     enum class ResourceType(val label: String) {
         MASTER_PLAYLIST("master playlist"),
@@ -143,11 +227,13 @@ object LocalStreamProxyServer : Closeable {
             get() = resourceId?.let { " res=$it" } ?: ""
 
         fun logStart() {
-            Log.d(
-                TAG,
-                "[#$requestId]$sessionTag$resourceTag START $method $routeType ($resourceType) " +
-                        "upstream=${sanitizeUrl(targetUrl)} range=${rangeReceived ?: "none"} (fwd=$rangeForwarded)"
-            )
+            if (verboseDiagnostics) {
+                Log.d(
+                    TAG,
+                    "[#$requestId]$sessionTag$resourceTag START $method $routeType ($resourceType) " +
+                            "upstream=${sanitizeUrl(targetUrl)} range=${rangeReceived ?: "none"} (fwd=$rangeForwarded)"
+                )
+            }
         }
 
         fun onHeadersReceived(status: Int, type: String, length: Long) {
@@ -155,11 +241,13 @@ object LocalStreamProxyServer : Closeable {
             upstreamStatus = status
             contentType = type
             contentLength = length
-            Log.d(
-                TAG,
-                "[#$requestId]$sessionTag HEADERS in ${timeToHeaders}ms: status=$status " +
-                        "type='$type' len=$length"
-            )
+            if (verboseDiagnostics) {
+                Log.d(
+                    TAG,
+                    "[#$requestId]$sessionTag HEADERS in ${timeToHeaders}ms: status=$status " +
+                            "type='$type' len=$length"
+                )
+            }
         }
 
         fun onFirstByte() {
@@ -170,14 +258,25 @@ object LocalStreamProxyServer : Closeable {
 
         fun onComplete() {
             val totalDuration = System.currentTimeMillis() - startTime
-            Log.d(
-                TAG,
-                "[#$requestId]$sessionTag DONE in ${totalDuration}ms: bytes=$bytesTransferred " +
-                        "(headers=${timeToHeaders}ms, ttfb=${timeToFirstByte}ms)"
-            )
+            totalBytesTransferred.addAndGet(bytesTransferred)
+            val completed = totalCompletedRequests.incrementAndGet()
+            if (verboseDiagnostics) {
+                Log.d(
+                    TAG,
+                    "[#$requestId]$sessionTag DONE in ${totalDuration}ms: bytes=$bytesTransferred " +
+                            "(headers=${timeToHeaders}ms, ttfb=${timeToFirstByte}ms)"
+                )
+            } else if (completed % TELEMETRY_LOG_INTERVAL == 0L) {
+                Log.i(
+                    TAG,
+                    "[Telemetry] requests=$completed active=${activeTransfers.get()} " +
+                            "bytes=${totalBytesTransferred.get()} failures=${totalTransferFailures.get()}"
+                )
+            }
         }
 
         fun onError(stage: String, error: Throwable?) {
+            totalTransferFailures.incrementAndGet()
             val totalDuration = System.currentTimeMillis() - startTime
             failureStage = stage
             failureReason = error?.message ?: "unknown"
@@ -462,6 +561,19 @@ object LocalStreamProxyServer : Closeable {
         }
     }
 
+    fun isKnownBinaryResource(type: ResourceType): Boolean {
+        return type == ResourceType.SEGMENT ||
+                type == ResourceType.INIT_MAP ||
+                type == ResourceType.KEY ||
+                type == ResourceType.SUBTITLE
+    }
+
+    fun isExplicitHlsMimeType(contentType: String): Boolean {
+        return contentType.contains("application/vnd.apple.mpegurl", ignoreCase = true) ||
+                contentType.contains("application/x-mpegurl", ignoreCase = true) ||
+                contentType.contains("audio/mpegurl", ignoreCase = true)
+    }
+
     @Synchronized
     fun ensureStarted(): Int {
         if (isRunning.get() && serverSocket != null && !serverSocket!!.isClosed) {
@@ -703,7 +815,8 @@ object LocalStreamProxyServer : Closeable {
         var clientOut: OutputStream? = null
         try {
             clientIn = client.getInputStream()
-            clientOut = client.getOutputStream()
+            val rawOut = client.getOutputStream()
+            clientOut = BufferedClientOutputStream(rawOut, DEFAULT_CLIENT_BUFFER_SIZE)
 
             val parsed = readHttpRequest(clientIn) ?: return
             val method = parsed.method.uppercase()
@@ -793,6 +906,10 @@ object LocalStreamProxyServer : Closeable {
             Log.e(TAG, "Error handling client request: ${t.message}")
         } finally {
             try {
+                clientOut?.flush()
+            } catch (_: Throwable) {
+            }
+            try {
                 client.close()
             } catch (_: Throwable) {
             }
@@ -881,11 +998,9 @@ object LocalStreamProxyServer : Closeable {
         contentType: String,
         targetUrl: String
     ): Boolean {
+        hlsInspectionCount.incrementAndGet()
         // 1. Explicit HLS MIME Type
-        if (contentType.contains("application/vnd.apple.mpegurl", ignoreCase = true) ||
-            contentType.contains("application/x-mpegurl", ignoreCase = true) ||
-            contentType.contains("audio/mpegurl", ignoreCase = true)
-        ) {
+        if (isExplicitHlsMimeType(contentType)) {
             return true
         }
 
@@ -960,176 +1075,191 @@ object LocalStreamProxyServer : Closeable {
         resource: ResourceRecord? = null,
         expectedPlaylist: Boolean? = null
     ): Boolean {
-        val reqId = requestSeq.incrementAndGet()
-        val record = resource ?: session.getResourceRecord(targetUrl)
-        val inferredType = record?.type ?: inferResourceType(targetUrl)
-        val isMediaFile = inferredType == ResourceType.SEGMENT ||
-                inferredType == ResourceType.INIT_MAP ||
-                inferredType == ResourceType.KEY
-        val isM3u8Url = targetUrl.substringBefore("?").endsWith(".m3u8", ignoreCase = true)
-        val isPlaylistExpected = expectedPlaylist ?: (
-                isMasterRoute ||
-                        inferredType == ResourceType.MASTER_PLAYLIST ||
-                        inferredType == ResourceType.MEDIA_PLAYLIST ||
-                        (isM3u8Url && !isMediaFile)
-                )
-
-        val rangeHeader = clientHeaders["range"]
-        val forwardRange = !isPlaylistExpected &&
-                inferredType != ResourceType.KEY &&
-                inferredType != ResourceType.SUBTITLE &&
-                !rangeHeader.isNullOrBlank()
-
-        val resType = when {
-            isMasterRoute -> ResourceType.MASTER_PLAYLIST.label
-            else -> inferredType.label
-        }
-
-        val diag = RequestDiagnostic(
-            requestId = reqId,
-            method = method,
-            routeType = if (isMasterRoute) "master" else "res",
-            resourceType = resType,
-            targetUrl = targetUrl,
-            rangeReceived = rangeHeader,
-            rangeForwarded = forwardRange,
-            sessionId = session.sessionId,
-            resourceId = record?.id
-        )
-        diag.logStart()
-
-        val requestBuilder = Request.Builder().url(targetUrl)
-        val isSafe = isSafeHost(session, targetUrl)
-        applyUpstreamHeaders(
-            requestBuilder = requestBuilder,
-            session = session,
-            targetUrl = targetUrl,
-            specificHeaders = specificHeaders ?: record?.headers,
-            isSafe = isSafe
-        )
-
-        if (forwardRange) {
-            requestBuilder.header("Range", rangeHeader)
-        }
-
-        // Bypass stale HTTP cache for HLS playlist refreshes
-        if (isPlaylistExpected) {
-            requestBuilder.cacheControl(CacheControl.FORCE_NETWORK)
-        }
-
-        if (method == "HEAD") {
-            requestBuilder.head()
-        }
-
-        val response: Response = try {
-            executeUpstream(requestBuilder.build())
-        } catch (t: Throwable) {
-            diag.onError("connecting/waiting_response", t)
-            Log.e(
-                TAG,
-                "Upstream request failed for ${sanitizeUrl(targetUrl)}: " +
-                        "${t.javaClass.simpleName}: ${t.message}"
-            )
-            if (!fallbackOnFailure) {
-                writeError(clientOut, 502, "Bad Gateway: ${t.message}")
-            }
-            return false
-        }
-
+        activeTransfers.incrementAndGet()
         try {
-            val responseBody = response.body
-            val contentType = response.header("Content-Type") ?: ""
-            val contentLength = responseBody.contentLength()
-            diag.onHeadersReceived(response.code, contentType, contentLength)
+            val reqId = requestSeq.incrementAndGet()
+            val record = resource ?: session.getResourceRecord(targetUrl)
+            val inferredType = record?.type ?: inferResourceType(targetUrl)
+            val isMediaFile = inferredType == ResourceType.SEGMENT ||
+                    inferredType == ResourceType.INIT_MAP ||
+                    inferredType == ResourceType.KEY
+            val isM3u8Url = targetUrl.substringBefore("?").endsWith(".m3u8", ignoreCase = true)
+            val isPlaylistExpected = expectedPlaylist ?: (
+                    isMasterRoute ||
+                            inferredType == ResourceType.MASTER_PLAYLIST ||
+                            inferredType == ResourceType.MEDIA_PLAYLIST ||
+                            (isM3u8Url && !isMediaFile)
+                    )
 
-            if (!response.isSuccessful && response.code != 206) {
-                diag.onError("upstream_status_${response.code}", null)
-                Log.w(
+            val rangeHeader = clientHeaders["range"]
+            val forwardRange = !isPlaylistExpected &&
+                    inferredType != ResourceType.KEY &&
+                    inferredType != ResourceType.SUBTITLE &&
+                    !rangeHeader.isNullOrBlank()
+
+            val resType = when {
+                isMasterRoute -> ResourceType.MASTER_PLAYLIST.label
+                else -> inferredType.label
+            }
+
+            val diag = RequestDiagnostic(
+                requestId = reqId,
+                method = method,
+                routeType = if (isMasterRoute) "master" else "res",
+                resourceType = resType,
+                targetUrl = targetUrl,
+                rangeReceived = rangeHeader,
+                rangeForwarded = forwardRange,
+                sessionId = session.sessionId,
+                resourceId = record?.id
+            )
+            diag.logStart()
+
+            val requestBuilder = Request.Builder().url(targetUrl)
+            val isSafe = isSafeHost(session, targetUrl)
+            applyUpstreamHeaders(
+                requestBuilder = requestBuilder,
+                session = session,
+                targetUrl = targetUrl,
+                specificHeaders = specificHeaders ?: record?.headers,
+                isSafe = isSafe
+            )
+
+            if (forwardRange) {
+                requestBuilder.header("Range", rangeHeader)
+            }
+
+            // Bypass stale HTTP cache for HLS playlist refreshes
+            if (isPlaylistExpected) {
+                requestBuilder.cacheControl(CacheControl.FORCE_NETWORK)
+            }
+
+            if (method == "HEAD") {
+                requestBuilder.head()
+            }
+
+            val response: Response = try {
+                executeUpstream(requestBuilder.build())
+            } catch (t: Throwable) {
+                diag.onError("connecting/waiting_response", t)
+                Log.e(
                     TAG,
-                    "Upstream error response: code=${response.code} " +
-                            "message=${response.message} for ${sanitizeUrl(targetUrl)}"
+                    "Upstream request failed for ${sanitizeUrl(targetUrl)}: " +
+                            "${t.javaClass.simpleName}: ${t.message}"
                 )
                 if (!fallbackOnFailure) {
-                    writeError(clientOut, response.code, response.message)
+                    writeError(clientOut, 502, "Bad Gateway: ${t.message}")
                 }
                 return false
             }
 
-            val isHls = checkIsHls(responseBody.source(), contentType, targetUrl)
+            try {
+                val responseBody = response.body
+                val contentType = response.header("Content-Type") ?: ""
+                val contentLength = responseBody.contentLength()
+                diag.onHeadersReceived(response.code, contentType, contentLength)
 
-            if (isPlaylistExpected && !isHls) {
-                diag.onError("unexpected_content_type", null)
-                Log.w(
-                    TAG,
-                    "Expected HLS playlist for ${sanitizeUrl(targetUrl)} but got non-HLS " +
-                            "(contentType='$contentType')"
-                )
-                if (!fallbackOnFailure) {
-                    writeError(clientOut, 502, "Bad Gateway: Upstream did not return a valid HLS playlist")
-                }
-                return false
-            }
-
-            if (isHls) {
-                val bodyText = try {
-                    responseBody.string()
-                } catch (t: Throwable) {
-                    diag.onError("reading_playlist", t)
+                if (!response.isSuccessful && response.code != 206) {
+                    diag.onError("upstream_status_${response.code}", null)
+                    Log.w(
+                        TAG,
+                        "Upstream error response: code=${response.code} " +
+                                "message=${response.message} for ${sanitizeUrl(targetUrl)}"
+                    )
                     if (!fallbackOnFailure) {
-                        writeError(clientOut, 502, "Bad Gateway: Could not read HLS playlist")
-                    }
-                    return false
-                }
-                if (bodyText.isBlank() || (!bodyText.contains("#EXTM3U") && !bodyText.contains("#EXT"))) {
-                    diag.onError("empty_playlist", null)
-                    if (!fallbackOnFailure) {
-                        writeError(clientOut, 502, "Bad Gateway: Empty or malformed HLS playlist from upstream")
+                        writeError(clientOut, response.code, response.message)
                     }
                     return false
                 }
 
-                val currentPlaylistUrl = response.request.url.toString()
-                session.addKnownHost(currentPlaylistUrl)
-                val proxyBaseUrl = "http://127.0.0.1:$port"
+                val isExplicitHls = isExplicitHlsMimeType(contentType)
+                val shouldSkipInspection = !isPlaylistExpected &&
+                        record != null &&
+                        isKnownBinaryResource(record.type) &&
+                        !isExplicitHls
 
-                val rewritten = rewriteHlsPlaylist(
-                    bodyText,
-                    currentPlaylistUrl,
-                    session,
-                    proxyBaseUrl,
-                    specificHeaders ?: record?.headers ?: session.effectiveHeaders
-                )
-                val bodyBytes = rewritten.toByteArray(Charsets.UTF_8)
+                val isHls = if (shouldSkipInspection) {
+                    false
+                } else {
+                    checkIsHls(responseBody.source(), contentType, targetUrl)
+                }
 
-                diag.onFirstByte()
-                diag.bytesTransferred = bodyBytes.size.toLong()
+                if (isPlaylistExpected && !isHls) {
+                    diag.onError("unexpected_content_type", null)
+                    Log.w(
+                        TAG,
+                        "Expected HLS playlist for ${sanitizeUrl(targetUrl)} but got non-HLS " +
+                                "(contentType='$contentType')"
+                    )
+                    if (!fallbackOnFailure) {
+                        writeError(clientOut, 502, "Bad Gateway: Upstream did not return a valid HLS playlist")
+                    }
+                    return false
+                }
 
-                val responseHeaders = mutableMapOf(
-                    "Content-Type" to "application/vnd.apple.mpegurl",
-                    "Content-Length" to bodyBytes.size.toString(),
-                    "Access-Control-Allow-Origin" to "*",
-                    "Accept-Ranges" to "none",
-                    "Cache-Control" to "no-cache, no-store, must-revalidate",
-                    "Pragma" to "no-cache",
-                    "Connection" to "close"
-                )
-                writeResponse(
-                    clientOut,
-                    200,
-                    "OK",
-                    responseHeaders,
-                    if (method != "HEAD") bodyBytes else ByteArray(0)
-                )
-                diag.onComplete()
-                return true
-            } else {
-                return handleMediaStream(method, response, rangeHeader, clientOut, diag)
+                if (isHls) {
+                    val bodyText = try {
+                        responseBody.string()
+                    } catch (t: Throwable) {
+                        diag.onError("reading_playlist", t)
+                        if (!fallbackOnFailure) {
+                            writeError(clientOut, 502, "Bad Gateway: Could not read HLS playlist")
+                        }
+                        return false
+                    }
+                    if (bodyText.isBlank() || (!bodyText.contains("#EXTM3U") && !bodyText.contains("#EXT"))) {
+                        diag.onError("empty_playlist", null)
+                        if (!fallbackOnFailure) {
+                            writeError(clientOut, 502, "Bad Gateway: Empty or malformed HLS playlist from upstream")
+                        }
+                        return false
+                    }
+
+                    val currentPlaylistUrl = response.request.url.toString()
+                    session.addKnownHost(currentPlaylistUrl)
+                    val proxyBaseUrl = "http://127.0.0.1:$port"
+
+                    val rewritten = rewriteHlsPlaylist(
+                        bodyText,
+                        currentPlaylistUrl,
+                        session,
+                        proxyBaseUrl,
+                        specificHeaders ?: record?.headers ?: session.effectiveHeaders
+                    )
+                    val bodyBytes = rewritten.toByteArray(Charsets.UTF_8)
+
+                    diag.onFirstByte()
+                    diag.bytesTransferred = bodyBytes.size.toLong()
+
+                    val responseHeaders = mutableMapOf(
+                        "Content-Type" to "application/vnd.apple.mpegurl",
+                        "Content-Length" to bodyBytes.size.toString(),
+                        "Access-Control-Allow-Origin" to "*",
+                        "Accept-Ranges" to "none",
+                        "Cache-Control" to "no-cache, no-store, must-revalidate",
+                        "Pragma" to "no-cache",
+                        "Connection" to "close"
+                    )
+                    writeResponse(
+                        clientOut,
+                        200,
+                        "OK",
+                        responseHeaders,
+                        if (method != "HEAD") bodyBytes else ByteArray(0)
+                    )
+                    diag.onComplete()
+                    return true
+                } else {
+                    return handleMediaStream(method, response, rangeHeader, clientOut, diag)
+                }
+            } catch (t: Throwable) {
+                diag.onError("streaming_body", t)
+                throw t
+            } finally {
+                response.close()
             }
-        } catch (t: Throwable) {
-            diag.onError("streaming_body", t)
-            throw t
         } finally {
-            response.close()
+            activeTransfers.decrementAndGet()
         }
     }
 
@@ -1357,16 +1487,18 @@ object LocalStreamProxyServer : Closeable {
         val inStream = responseBody.byteStream()
         var totalTransferred = 0L
         var firstByteLogged = false
+        var firstBodyWritten = false
         var truncated = false
 
         try {
+            val buffer = getTransferBuffer()
             if (startOffset > 0L) {
                 var skipped = 0L
                 while (skipped < startOffset) {
                     val n = inStream.skip(startOffset - skipped)
                     if (n <= 0) {
-                        val temp = ByteArray(minOf(BUFFER_SIZE.toLong(), startOffset - skipped).toInt())
-                        val read = inStream.read(temp)
+                        val toSkip = minOf(buffer.size.toLong(), startOffset - skipped).toInt()
+                        val read = inStream.read(buffer, 0, toSkip)
                         if (read == -1) {
                             truncated = true
                             break
@@ -1378,15 +1510,16 @@ object LocalStreamProxyServer : Closeable {
                 }
             }
 
-            val buffer = ByteArray(BUFFER_SIZE)
+            val bufferedClientOut = clientOut as? BufferedClientOutputStream
+
             while (!truncated) {
                 val remaining = if (bytesToStream >= 0) bytesToStream - totalTransferred else -1L
                 if (bytesToStream >= 0 && remaining <= 0L) break
 
                 val toRead = if (bytesToStream >= 0) {
-                    minOf(BUFFER_SIZE.toLong(), remaining).toInt()
+                    minOf(buffer.size.toLong(), remaining).toInt()
                 } else {
-                    BUFFER_SIZE
+                    buffer.size
                 }
                 if (toRead <= 0) break
 
@@ -1415,7 +1548,16 @@ object LocalStreamProxyServer : Closeable {
                         writeChunk(clientOut, buffer, read)
                     } else {
                         clientOut.write(buffer, 0, read)
+                    }
+
+                    val bufferedBytes = bufferedClientOut?.bufferedBytes ?: 0
+                    val shouldFlush = !firstBodyWritten ||
+                            bufferedBytes >= BATCH_FLUSH_THRESHOLD ||
+                            inStream.available() == 0
+
+                    if (shouldFlush) {
                         clientOut.flush()
+                        firstBodyWritten = true
                     }
                 } catch (t: Throwable) {
                     diag.onError("client_write_disconnect", t)
@@ -1444,7 +1586,7 @@ object LocalStreamProxyServer : Closeable {
 
         if (chunked) {
             try {
-                clientOut.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                clientOut.write(ZERO_CHUNK)
                 clientOut.flush()
             } catch (t: Throwable) {
                 diag.onError("client_write_disconnect", t)
@@ -1525,19 +1667,37 @@ object LocalStreamProxyServer : Closeable {
             if (length >= 0) headers["Content-Length"] = length.toString()
             writeStatusAndHeaders(clientOut, response.code, response.message.ifBlank { "OK" }, headers)
             if (method != "HEAD") {
+                val buffer = getTransferBuffer()
+                val inStream = response.body.byteStream()
+                var firstBodyWritten = false
+                val bufferedClientOut = clientOut as? BufferedClientOutputStream
                 if (length >= 0) {
-                    response.body.byteStream().copyTo(clientOut, BUFFER_SIZE)
+                    var remaining = length
+                    while (remaining > 0L) {
+                        val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                        val read = inStream.read(buffer, 0, toRead)
+                        if (read == -1) break
+                        clientOut.write(buffer, 0, read)
+                        val bufferedBytes = bufferedClientOut?.bufferedBytes ?: 0
+                        if (!firstBodyWritten || bufferedBytes >= BATCH_FLUSH_THRESHOLD || inStream.available() == 0) {
+                            clientOut.flush()
+                            firstBodyWritten = true
+                        }
+                        remaining -= read
+                    }
                     clientOut.flush()
                 } else {
-                    val buffer = ByteArray(BUFFER_SIZE)
-                    response.body.byteStream().use { input ->
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            writeChunk(clientOut, buffer, read)
+                    while (true) {
+                        val read = inStream.read(buffer, 0, buffer.size)
+                        if (read == -1) break
+                        writeChunk(clientOut, buffer, read)
+                        val bufferedBytes = bufferedClientOut?.bufferedBytes ?: 0
+                        if (!firstBodyWritten || bufferedBytes >= BATCH_FLUSH_THRESHOLD || inStream.available() == 0) {
+                            clientOut.flush()
+                            firstBodyWritten = true
                         }
                     }
-                    clientOut.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    clientOut.write(ZERO_CHUNK)
                     clientOut.flush()
                 }
             }
@@ -1605,19 +1765,37 @@ object LocalStreamProxyServer : Closeable {
             if (length >= 0) responseHeaders["Content-Length"] = length.toString()
             writeStatusAndHeaders(clientOut, response.code, response.message.ifBlank { "OK" }, responseHeaders)
             if (method != "HEAD") {
+                val buffer = getTransferBuffer()
+                val inStream = response.body.byteStream()
+                var firstBodyWritten = false
+                val bufferedClientOut = clientOut as? BufferedClientOutputStream
                 if (length >= 0) {
-                    response.body.byteStream().copyTo(clientOut, BUFFER_SIZE)
+                    var remaining = length
+                    while (remaining > 0L) {
+                        val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                        val read = inStream.read(buffer, 0, toRead)
+                        if (read == -1) break
+                        clientOut.write(buffer, 0, read)
+                        val bufferedBytes = bufferedClientOut?.bufferedBytes ?: 0
+                        if (!firstBodyWritten || bufferedBytes >= BATCH_FLUSH_THRESHOLD || inStream.available() == 0) {
+                            clientOut.flush()
+                            firstBodyWritten = true
+                        }
+                        remaining -= read
+                    }
                     clientOut.flush()
                 } else {
-                    val buffer = ByteArray(BUFFER_SIZE)
-                    response.body.byteStream().use { input ->
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            writeChunk(clientOut, buffer, read)
+                    while (true) {
+                        val read = inStream.read(buffer, 0, buffer.size)
+                        if (read == -1) break
+                        writeChunk(clientOut, buffer, read)
+                        val bufferedBytes = bufferedClientOut?.bufferedBytes ?: 0
+                        if (!firstBodyWritten || bufferedBytes >= BATCH_FLUSH_THRESHOLD || inStream.available() == 0) {
+                            clientOut.flush()
+                            firstBodyWritten = true
                         }
                     }
-                    clientOut.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    clientOut.write(ZERO_CHUNK)
                     clientOut.flush()
                 }
             }
@@ -2116,11 +2294,11 @@ object LocalStreamProxyServer : Closeable {
     }
 
     private fun writeChunk(out: OutputStream, buffer: ByteArray, length: Int) {
-        out.write(Integer.toHexString(length).toByteArray(Charsets.US_ASCII))
-        out.write("\r\n".toByteArray(Charsets.US_ASCII))
+        val hex = Integer.toHexString(length).toByteArray(Charsets.US_ASCII)
+        out.write(hex)
+        out.write(CRLF)
         out.write(buffer, 0, length)
-        out.write("\r\n".toByteArray(Charsets.US_ASCII))
-        out.flush()
+        out.write(CRLF)
     }
 
     private fun writeStatusAndHeaders(
@@ -2205,6 +2383,12 @@ object LocalStreamProxyServer : Closeable {
     internal fun resetForTest() {
         sessions.clear()
         stopListening()
+        totalCompletedRequests.set(0)
+        totalBytesTransferred.set(0)
+        activeTransfers.set(0)
+        totalTransferFailures.set(0)
+        hlsInspectionCount.set(0)
+        verboseDiagnostics = false
     }
 
     @Synchronized
