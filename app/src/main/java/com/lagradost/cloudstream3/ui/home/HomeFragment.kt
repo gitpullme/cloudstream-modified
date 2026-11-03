@@ -613,6 +613,11 @@ class HomeFragment : BaseFragment<FragmentHomeBinding>(
         return super.onCreateView(inflater, container, savedInstanceState)
     }
 
+    override fun onResume() {
+        super.onResume()
+        homeViewModel.reloadStored()
+    }
+
     override fun onDestroyView() {
         (activity as? ComponentActivity)?.detachBackPressedCallback("HomeFragment_BackPress")
         bottomSheetDialog?.ownHide()

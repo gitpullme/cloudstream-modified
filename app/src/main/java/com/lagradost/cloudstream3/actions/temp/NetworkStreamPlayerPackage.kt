@@ -9,12 +9,14 @@ import com.lagradost.api.Log
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.setKey
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.R
+import com.lagradost.cloudstream3.actions.ExternalNextEpisodeContext
 import com.lagradost.cloudstream3.actions.ExternalPlaybackMediaSessionTracker
 import com.lagradost.cloudstream3.actions.ExternalPlaybackRequestBuilder
 import com.lagradost.cloudstream3.actions.ExternalPlaybackSessionStore
 import com.lagradost.cloudstream3.actions.NetworkStreamPlayerLauncher
-import com.lagradost.cloudstream3.actions.PendingExternalPlayback
+import com.lagradost.cloudstream3.actions.NextEpisodeAwareAction
 import com.lagradost.cloudstream3.actions.OpenInAppAction
+import com.lagradost.cloudstream3.actions.PendingExternalPlayback
 import com.lagradost.cloudstream3.ui.result.LinkLoadingResult
 import com.lagradost.cloudstream3.ui.result.ResultEpisode
 import com.lagradost.cloudstream3.utils.AppContextUtils.isAppInstalled
@@ -29,18 +31,37 @@ import com.lagradost.cloudstream3.utils.txt
 open class NetworkStreamPlayerPackage : OpenInAppAction(
     appName = txt(R.string.network_stream_player),
     packageName = NetworkStreamPlayerLauncher.PACKAGE_NAME
-) {
+), NextEpisodeAwareAction {
     override val sourceTypes: Set<ExtractorLinkType> =
         setOf(ExtractorLinkType.VIDEO, ExtractorLinkType.M3U8, ExtractorLinkType.DASH)
 
     override val oneSource: Boolean = true
-
 
     override suspend fun runAction(
         context: Context?,
         video: ResultEpisode,
         result: LinkLoadingResult,
         index: Int?
+    ) {
+        runActionInternal(context, video, result, index, null)
+    }
+
+    override suspend fun runActionWithNextEpisode(
+        context: Context?,
+        video: ResultEpisode,
+        result: LinkLoadingResult,
+        index: Int?,
+        nextEpisodeContext: ExternalNextEpisodeContext,
+    ) {
+        runActionInternal(context, video, result, index, nextEpisodeContext)
+    }
+
+    private suspend fun runActionInternal(
+        context: Context?,
+        video: ResultEpisode,
+        result: LinkLoadingResult,
+        index: Int?,
+        nextEpisodeContext: ExternalNextEpisodeContext?,
     ) {
         if (context == null) return
 
@@ -71,7 +92,14 @@ open class NetworkStreamPlayerPackage : OpenInAppAction(
         var pending: PendingExternalPlayback? = null
         try {
             NetworkStreamPlayerLauncher.configureIntent(context, intent, request)
-            pending = ExternalPlaybackSessionStore.begin(context, video, request, packageName)
+            pending = ExternalPlaybackSessionStore.begin(
+                context = context,
+                video = video,
+                request = request,
+                packageName = packageName,
+                nextEpisode = nextEpisodeContext?.nextEpisode,
+                nextEpisodeResolutionComplete = nextEpisodeContext?.resolutionComplete ?: false,
+            )
             setKey("last_opened", video)
             ExternalPlaybackMediaSessionTracker.ensureStarted(context, "launch-path")
             launchResult(intent)

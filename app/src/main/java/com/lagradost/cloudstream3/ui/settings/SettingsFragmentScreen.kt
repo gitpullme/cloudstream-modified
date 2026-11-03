@@ -4,8 +4,12 @@ import android.annotation.SuppressLint
 import android.os.Bundle
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -13,14 +17,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
@@ -28,11 +35,13 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ProvideTextStyle
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.NonRestartableComposable
 import androidx.compose.runtime.collectAsState
@@ -55,15 +64,23 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.PreviewLightDark
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
 import com.lagradost.cloudstream3.BuildConfig
 import com.lagradost.cloudstream3.CommonActivity.activity
@@ -76,6 +93,7 @@ import com.lagradost.cloudstream3.utils.UIHelper.navigate
 import com.lagradost.cloudstream3.utils.txt
 import com.lagradost.cloudstream4.compose.Screen
 import com.lagradost.cloudstream4.compose.TV
+import com.lagradost.cloudstream4.compose.WhiteButton
 import com.lagradost.cloudstream4.compose.circleBorder
 import com.lagradost.cloudstream4.compose.focusOutline
 import com.lagradost.cloudstream4.compose.isLayout
@@ -430,6 +448,7 @@ object SettingsFragmentScreen : Screen {
 
     @Composable
     fun BuildStamp() {
+        var showEasterEgg by remember { mutableStateOf(false) }
         val (commitHash, buildTimestamp) = remember {
             val commitHash = activity?.currentCommitHash() ?: ""
             val buildTimestamp = SimpleDateFormat.getDateTimeInstance(
@@ -441,30 +460,229 @@ object SettingsFragmentScreen : Screen {
             commitHash to buildTimestamp
         }
 
-        Row(
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically,
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(50.dp)
-                .focusOutline()
-                .clickable {
-                    clipboardHelper(
-                        txt(R.string.extension_version),
-                        "${BuildConfig.VERSION_NAME} $commitHash $buildTimestamp"
-                    )
-                },
+                .padding(bottom = 16.dp)
         ) {
-            ProvideTextStyle(MaterialTheme.typography.bodyMedium) {
-                Text(text = BuildConfig.VERSION_NAME)
-                if (commitHash != "") {
+            Row(
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .focusOutline()
+                    .clickable {
+                        clipboardHelper(
+                            txt(R.string.extension_version),
+                            "${BuildConfig.VERSION_NAME} $commitHash $buildTimestamp"
+                        )
+                    },
+            ) {
+                ProvideTextStyle(MaterialTheme.typography.bodyMedium) {
+                    Text(text = BuildConfig.VERSION_NAME)
+                    if (commitHash != "") {
+                        Text("•")
+                        Text(text = commitHash)
+                    }
                     Text("•")
-                    Text(text = commitHash)
+                    Text(text = buildTimestamp)
                 }
-                Text("•")
-                Text(text = buildTimestamp)
+            }
+
+            DeveloperSignature(
+                onClick = { showEasterEgg = true }
+            )
+        }
+
+        if (showEasterEgg) {
+            DeveloperEasterEggDialog(
+                onDismiss = { showEasterEgg = false }
+            )
+        }
+    }
+
+    @Composable
+    fun DeveloperSignature(
+        onClick: () -> Unit,
+        modifier: Modifier = Modifier,
+    ) {
+        val cardShape = RoundedCornerShape(14.dp)
+        Surface(
+            shape = cardShape,
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+            border = BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+            ),
+            modifier = modifier
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .fillMaxWidth()
+                .focusOutline(shape = cardShape)
+                .clip(cardShape)
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = "Developer signature",
+                    onClick = onClick,
+                )
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .fillMaxWidth()
+            ) {
+                // Monogram container
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f)
+                        )
+                        .border(
+                            width = 1.dp,
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        .semantics { contentDescription = "DA Monogram" }
+                ) {
+                    Text(
+                        text = "DA",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        letterSpacing = 1.sp,
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                // Signature text hierarchy
+                Column(
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "A PERSONAL TOUCH",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 1.2.sp,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Icon(
+                            painter = painterResource(R.drawable.kid_star_24px),
+                            contentDescription = null,
+                            modifier = Modifier.size(10.dp),
+                            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(1.dp))
+
+                    Text(
+                        text = "built by dikshant",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+
+                    Text(
+                        text = "almighty :)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                // Subtle sparkle detail on the trailing side
+                Icon(
+                    painter = painterResource(R.drawable.kid_star_24px),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .padding(start = 8.dp)
+                        .size(16.dp),
+                    tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f),
+                )
             }
         }
+    }
+
+    @Composable
+    fun DeveloperEasterEggDialog(
+        onDismiss: () -> Unit
+    ) {
+        val focusRequester = remember { FocusRequester() }
+        LaunchedEffect(Unit) {
+            focusRequester.requestFocus()
+        }
+
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            icon = {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f)
+                        )
+                        .border(
+                            1.dp,
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.3f),
+                            RoundedCornerShape(12.dp)
+                        )
+                        .semantics { contentDescription = "DA Monogram" }
+                ) {
+                    Text(
+                        text = "DA",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        letterSpacing = 1.sp,
+                    )
+                }
+            },
+            title = {
+                Text(
+                    text = "built by dikshant almighty :)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            },
+            text = {
+                Text(
+                    text = "this was modified by dikshant for his people, hope you like it",
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                WhiteButton(
+                    text = stringResource(R.string.ok),
+                    modifier = Modifier.focusRequester(focusRequester),
+                    onClick = onDismiss
+                )
+            },
+            containerColor = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
+            shape = RoundedCornerShape(20.dp),
+        )
     }
 }
 

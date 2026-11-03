@@ -1,17 +1,24 @@
 package com.lagradost.cloudstream3
 
 import com.lagradost.cloudstream3.actions.ExternalPlaybackExpired
+import com.lagradost.cloudstream3.actions.ExternalPlaybackHistoryDelegate
 import com.lagradost.cloudstream3.actions.ExternalPlaybackProgressEngine
 import com.lagradost.cloudstream3.actions.ExternalPlaybackResumeAction
 import com.lagradost.cloudstream3.actions.ExternalPlaybackResumeController
 import com.lagradost.cloudstream3.actions.ExternalPlaybackResumePolicy
 import com.lagradost.cloudstream3.actions.ExternalPlaybackResumeState
 import com.lagradost.cloudstream3.actions.ExternalPlaybackSaveReason
+import com.lagradost.cloudstream3.actions.ExternalPlaybackSessionStore
 import com.lagradost.cloudstream3.actions.ExternalPlaybackSnapshot
 import com.lagradost.cloudstream3.actions.ExternalPlaybackState
+import com.lagradost.cloudstream3.actions.ExternalPlaybackUpdate
+import com.lagradost.cloudstream3.actions.NextEpisodeResolution
+import com.lagradost.cloudstream3.actions.NextEpisodeResolver
 import com.lagradost.cloudstream3.actions.PendingExternalPlayback
 import com.lagradost.cloudstream3.ui.result.ResultEpisode
+import com.lagradost.cloudstream3.ui.result.ResultViewModel2
 import com.lagradost.cloudstream3.ui.result.VideoWatchState
+import com.lagradost.cloudstream3.utils.AppUtils
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -1675,5 +1682,624 @@ class ExternalPlaybackTrackingTest {
 
         assertNotNull(lastUpdate)
         assertEquals(60_000L, lastUpdate!!.positionMs)
+    }
+
+    // -------------------------------------------------------------------------
+    // NextEpisodeResolver regression tests
+    // -------------------------------------------------------------------------
+
+    private fun seriesEpisode(
+        id: Int,
+        season: Int,
+        episode: Int,
+        parentId: Int = 500,
+        name: String = "Episode $episode",
+        tvType: TvType = TvType.TvSeries,
+        totalEpisodeIndex: Int? = null,
+    ): ResultEpisode {
+        return ResultEpisode(
+            headerName = "Season $season",
+            name = name,
+            poster = "https://example.com/poster.jpg",
+            episode = episode,
+            seasonIndex = season,
+            season = season,
+            data = "episode_data_$id",
+            apiName = "TestApi",
+            id = id,
+            index = episode - 1,
+            position = 0L,
+            duration = DURATION,
+            score = null,
+            description = "Description for $name",
+            isFiller = false,
+            tvType = tvType,
+            parentId = parentId,
+            videoWatchState = VideoWatchState.None,
+            totalEpisodeIndex = totalEpisodeIndex,
+        )
+    }
+
+    private class RecordingHistoryDelegate : ExternalPlaybackHistoryDelegate {
+        val setViewPosAndResumeCalls = mutableListOf<ViewPosAndResumeCall>()
+        val setViewPosCalls = mutableListOf<ViewPosCall>()
+        val setLastWatchedCalls = mutableListOf<LastWatchedCall>()
+        val removeLastWatchedCalls = mutableListOf<Int?>()
+        var bookmarksUpdatedCount = 0
+        var resultUiUpdatedCount = 0
+
+        val viewPosStore = mutableMapOf<Int, Pair<Long, Long>>()
+        val lastWatchedStore = mutableMapOf<Int, LastWatchedEntry>()
+
+        data class ViewPosAndResumeCall(
+            val id: Int?,
+            val position: Long,
+            val duration: Long,
+            val currentEpisode: Any?,
+            val nextEpisode: Any?,
+        )
+
+        data class ViewPosCall(
+            val id: Int?,
+            val position: Long,
+            val duration: Long,
+        )
+
+        data class LastWatchedCall(
+            val parentId: Int?,
+            val episodeId: Int?,
+            val episode: Int?,
+            val season: Int?,
+            val isFromDownload: Boolean,
+        )
+
+        data class LastWatchedEntry(
+            val parentId: Int?,
+            val episodeId: Int?,
+            val episode: Int?,
+            val season: Int?,
+        )
+
+        override fun setViewPosAndResume(
+            id: Int?,
+            position: Long,
+            duration: Long,
+            currentEpisode: Any?,
+            nextEpisode: Any?,
+        ) {
+            setViewPosAndResumeCalls.add(
+                ViewPosAndResumeCall(id, position, duration, currentEpisode, nextEpisode)
+            )
+            if (id != null) {
+                viewPosStore[id] = position to duration
+            }
+            val percentage = if (duration > 0) position * 100L / duration else 0L
+            val isCompleted = percentage >= 90L
+            val resumeMeta = if (isCompleted) nextEpisode else currentEpisode
+            if (resumeMeta == null && isCompleted) {
+                val current = currentEpisode as? ResultEpisode
+                if (current != null) {
+                    removeLastWatched(current.parentId)
+                }
+            } else if (resumeMeta is ResultEpisode) {
+                setLastWatched(
+                    resumeMeta.parentId,
+                    resumeMeta.id,
+                    resumeMeta.episode,
+                    resumeMeta.season,
+                    isFromDownload = false,
+                )
+            }
+        }
+
+        override fun setViewPos(id: Int?, position: Long, duration: Long) {
+            setViewPosCalls.add(ViewPosCall(id, position, duration))
+            if (id != null) {
+                viewPosStore[id] = position to duration
+            }
+        }
+
+        override fun setLastWatched(
+            parentId: Int?,
+            episodeId: Int?,
+            episode: Int?,
+            season: Int?,
+            isFromDownload: Boolean,
+        ) {
+            setLastWatchedCalls.add(
+                LastWatchedCall(parentId, episodeId, episode, season, isFromDownload)
+            )
+            if (parentId != null) {
+                lastWatchedStore[parentId] = LastWatchedEntry(parentId, episodeId, episode, season)
+            }
+        }
+
+        override fun removeLastWatched(parentId: Int?) {
+            removeLastWatchedCalls.add(parentId)
+            if (parentId != null) {
+                lastWatchedStore.remove(parentId)
+            }
+        }
+
+        override fun notifyBookmarksUpdated() {
+            bookmarksUpdatedCount++
+        }
+
+        override fun notifyResultUiUpdated() {
+            resultUiUpdatedCount++
+        }
+    }
+
+    @Test
+    fun `resolveNextEpisode advances episode 1 to episode 2 within same season`() {
+        val ep1 = seriesEpisode(id = 1, season = 1, episode = 1)
+        val ep2 = seriesEpisode(id = 2, season = 1, episode = 2)
+        val catalogue = mapOf(
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 1) to listOf(ep1, ep2)
+        )
+
+        val resolution = NextEpisodeResolver.resolveNextEpisode(catalogue, ep1)
+        assertTrue(resolution is NextEpisodeResolution.Found)
+        assertEquals(ep2.id, (resolution as NextEpisodeResolution.Found).nextEpisode.id)
+        assertTrue(resolution.isComplete)
+    }
+
+    @Test
+    fun `resolveNextEpisode advances final episode of season 1 to first episode of season 2`() {
+        val s1e1 = seriesEpisode(id = 1, season = 1, episode = 1)
+        val s1e2 = seriesEpisode(id = 2, season = 1, episode = 2)
+        val s2e1 = seriesEpisode(id = 3, season = 2, episode = 1)
+        val s2e2 = seriesEpisode(id = 4, season = 2, episode = 2)
+        val catalogue = mapOf(
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 1) to listOf(s1e1, s1e2),
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 2) to listOf(s2e1, s2e2),
+        )
+
+        val resolution = NextEpisodeResolver.resolveNextEpisode(catalogue, s1e2)
+        assertTrue(resolution is NextEpisodeResolution.Found)
+        val next = (resolution as NextEpisodeResolution.Found).nextEpisode
+        assertEquals(s2e1.id, next.id)
+        assertEquals(2, next.season)
+        assertEquals(1, next.episode)
+    }
+
+    @Test
+    fun `resolveNextEpisode returns LastEpisode for final episode of show`() {
+        val s1e1 = seriesEpisode(id = 1, season = 1, episode = 1)
+        val s2e1 = seriesEpisode(id = 2, season = 2, episode = 1)
+        val catalogue = mapOf(
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 1) to listOf(s1e1),
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 2) to listOf(s2e1),
+        )
+
+        val resolution = NextEpisodeResolver.resolveNextEpisode(catalogue, s2e1)
+        assertEquals(NextEpisodeResolution.LastEpisode, resolution)
+        assertTrue(resolution.isComplete)
+        assertNull(resolution.resolvedEpisode)
+    }
+
+    @Test
+    fun `resolveNextEpisode stays strictly within selected dub status for anime`() {
+        val dubEp1 = seriesEpisode(id = 10, season = 1, episode = 1, name = "Dub 1", tvType = TvType.Anime)
+        val dubEp2 = seriesEpisode(id = 20, season = 1, episode = 2, name = "Dub 2", tvType = TvType.Anime)
+        val subEp1 = seriesEpisode(id = 11, season = 1, episode = 1, name = "Sub 1", tvType = TvType.Anime)
+        val subEp2 = seriesEpisode(id = 21, season = 1, episode = 2, name = "Sub 2", tvType = TvType.Anime)
+        val subEp3 = seriesEpisode(id = 31, season = 1, episode = 3, name = "Sub 3", tvType = TvType.Anime)
+
+        val catalogue = mapOf(
+            ResultViewModel2.EpisodeIndexer(DubStatus.Dubbed, 1) to listOf(dubEp1, dubEp2),
+            ResultViewModel2.EpisodeIndexer(DubStatus.Subbed, 1) to listOf(subEp1, subEp2, subEp3),
+        )
+
+        // Resolving dubEp1 should yield dubEp2, not subEp2
+        val dubRes1 = NextEpisodeResolver.resolveNextEpisode(catalogue, dubEp1, preferredDubStatus = DubStatus.Dubbed)
+        assertTrue(dubRes1 is NextEpisodeResolution.Found)
+        assertEquals(dubEp2.id, (dubRes1 as NextEpisodeResolution.Found).nextEpisode.id)
+
+        // Resolving dubEp2 (the last dubbed episode) must return LastEpisode, NOT advance to subEp3
+        val dubRes2 = NextEpisodeResolver.resolveNextEpisode(catalogue, dubEp2, preferredDubStatus = DubStatus.Dubbed)
+        assertEquals(NextEpisodeResolution.LastEpisode, dubRes2)
+    }
+
+    @Test
+    fun `resolveNextEpisode is immune to UI descending sort order`() {
+        val ep1 = seriesEpisode(id = 1, season = 1, episode = 1)
+        val ep2 = seriesEpisode(id = 2, season = 1, episode = 2)
+        // Reverse order as if the UI sorted descending
+        val catalogue = mapOf(
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 1) to listOf(ep2, ep1)
+        )
+
+        val resolution = NextEpisodeResolver.resolveNextEpisode(catalogue, ep1)
+        assertTrue(resolution is NextEpisodeResolution.Found)
+        assertEquals(ep2.id, (resolution as NextEpisodeResolution.Found).nextEpisode.id)
+    }
+
+    @Test
+    fun `resolveNextEpisode returns Unknown when episode is not in catalogue`() {
+        val ep1 = seriesEpisode(id = 1, season = 1, episode = 1)
+        val uncatalogued = seriesEpisode(id = 9999, season = 1, episode = 99)
+        val catalogue = mapOf(
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 1) to listOf(ep1)
+        )
+
+        val resolution = NextEpisodeResolver.resolveNextEpisode(catalogue, uncatalogued)
+        assertEquals(NextEpisodeResolution.Unknown, resolution)
+        assertFalse(resolution.isComplete)
+        assertNull(resolution.resolvedEpisode)
+    }
+
+    @Test
+    fun `resolveNextEpisode handles duplicate IDs and empty catalogue safely`() {
+        val emptyCatalogue = emptyMap<ResultViewModel2.EpisodeIndexer, List<ResultEpisode>>()
+        val ep1 = seriesEpisode(id = 1, season = 1, episode = 1)
+        assertEquals(NextEpisodeResolver.resolveNextEpisode(emptyCatalogue, ep1), NextEpisodeResolution.Unknown)
+
+        // Duplicate episode entries in the list
+        val duplicateCatalogue = mapOf(
+            ResultViewModel2.EpisodeIndexer(DubStatus.None, 1) to listOf(ep1, ep1)
+        )
+        // With duplicate single episode, it should identify it as LastEpisode rather than returning itself
+        val resolution = NextEpisodeResolver.resolveNextEpisode(duplicateCatalogue, ep1)
+        assertEquals(NextEpisodeResolution.LastEpisode, resolution)
+    }
+
+    // -------------------------------------------------------------------------
+    // History persistence regression tests
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `completing episode with resolved next episode saves next episode as Continue Watching`() {
+        val ep1 = seriesEpisode(id = 1, season = 1, episode = 1, parentId = 500)
+        val ep2 = seriesEpisode(id = 2, season = 1, episode = 2, parentId = 500)
+        val delegate = RecordingHistoryDelegate()
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "session-1",
+            packageName = PACKAGE,
+            episode = ep1,
+            streamIdentifier = "hash1",
+            initialPositionMs = 0L,
+            expectedDurationMs = DURATION,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = ep2,
+            nextEpisodeResolutionComplete = true,
+        )
+
+        val update = ExternalPlaybackUpdate(
+            positionMs = 95_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 95_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        assertEquals(1, delegate.setViewPosAndResumeCalls.size)
+        val call = delegate.setViewPosAndResumeCalls.first()
+        assertEquals(ep1.id, call.id)
+        assertEquals(95_000L, call.position)
+        assertEquals(100_000L, call.duration)
+        assertEquals(ep1, call.currentEpisode)
+        assertEquals(ep2, call.nextEpisode)
+
+        // Continue Watching in simulated storage is now pointing to ep2
+        val lastWatched = delegate.lastWatchedStore[ep1.parentId]
+        assertNotNull(lastWatched)
+        assertEquals(ep2.id, lastWatched!!.episodeId)
+        assertEquals(ep2.episode, lastWatched.episode)
+        assertEquals(ep2.season, lastWatched.season)
+        assertEquals(ep2.parentId, lastWatched.parentId)
+
+        assertEquals(1, delegate.bookmarksUpdatedCount)
+        assertEquals(1, delegate.resultUiUpdatedCount)
+    }
+
+    @Test
+    fun `next episode saved in Continue Watching has correct parent ID, episode ID, season, and episode number`() {
+        val ep1 = seriesEpisode(id = 101, season = 1, episode = 10, parentId = 777)
+        val ep2 = seriesEpisode(id = 102, season = 2, episode = 1, parentId = 777)
+        val delegate = RecordingHistoryDelegate()
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "session-2",
+            packageName = PACKAGE,
+            episode = ep1,
+            streamIdentifier = "hash2",
+            initialPositionMs = 0L,
+            expectedDurationMs = DURATION,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = ep2,
+            nextEpisodeResolutionComplete = true,
+        )
+
+        val update = ExternalPlaybackUpdate(
+            positionMs = 92_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 92_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        val lastWatched = delegate.lastWatchedStore[777]
+        assertNotNull(lastWatched)
+        assertEquals(777, lastWatched!!.parentId)
+        assertEquals(102, lastWatched.episodeId)
+        assertEquals(2, lastWatched.season)
+        assertEquals(1, lastWatched.episode)
+    }
+
+    @Test
+    fun `completing confirmed final episode removes Continue Watching entry`() {
+        val finalEp = seriesEpisode(id = 99, season = 3, episode = 12, parentId = 888)
+        val delegate = RecordingHistoryDelegate()
+        delegate.setLastWatched(888, 99, 12, 3)
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "session-3",
+            packageName = PACKAGE,
+            episode = finalEp,
+            streamIdentifier = "hash3",
+            initialPositionMs = 0L,
+            expectedDurationMs = DURATION,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = null,
+            nextEpisodeResolutionComplete = true,
+        )
+
+        val update = ExternalPlaybackUpdate(
+            positionMs = 96_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 96_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        assertEquals(1, delegate.setViewPosAndResumeCalls.size)
+        assertNull(delegate.setViewPosAndResumeCalls.first().nextEpisode)
+        // Show is completely removed from Continue Watching because it reached the final episode
+        assertNull(delegate.lastWatchedStore[888])
+        assertTrue(delegate.removeLastWatchedCalls.contains(888))
+    }
+
+    @Test
+    fun `completing episode with unknown next episode preserves Continue Watching entry`() {
+        val ep = seriesEpisode(id = 55, season = 1, episode = 5, parentId = 999)
+        val delegate = RecordingHistoryDelegate()
+        delegate.setLastWatched(999, 55, 5, 1)
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "session-4",
+            packageName = PACKAGE,
+            episode = ep,
+            streamIdentifier = "hash4",
+            initialPositionMs = 0L,
+            expectedDurationMs = DURATION,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = null,
+            nextEpisodeResolutionComplete = false, // Unknown next episode
+        )
+
+        val update = ExternalPlaybackUpdate(
+            positionMs = 95_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 95_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        // Must NOT call removeLastWatched
+        assertTrue("removeLastWatched must not be called when next episode is unknown", delegate.removeLastWatchedCalls.isEmpty())
+        // View position of current episode is updated
+        assertEquals(95_000L to 100_000L, delegate.viewPosStore[55])
+        // Show remains in Continue Watching with current episode
+        val lastWatched = delegate.lastWatchedStore[999]
+        assertNotNull(lastWatched)
+        assertEquals(55, lastWatched!!.episodeId)
+        assertEquals(5, lastWatched.episode)
+    }
+
+    @Test
+    fun `progress below completion threshold resumes current episode`() {
+        val ep1 = seriesEpisode(id = 1, season = 1, episode = 1, parentId = 500)
+        val ep2 = seriesEpisode(id = 2, season = 1, episode = 2, parentId = 500)
+        val delegate = RecordingHistoryDelegate()
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "session-5",
+            packageName = PACKAGE,
+            episode = ep1,
+            streamIdentifier = "hash5",
+            initialPositionMs = 0L,
+            expectedDurationMs = DURATION,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = ep2,
+            nextEpisodeResolutionComplete = true,
+        )
+
+        // Watched 35% (< 90% completion threshold)
+        val update = ExternalPlaybackUpdate(
+            positionMs = 35_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 35_000L,
+            state = ExternalPlaybackState.PAUSED,
+            reason = ExternalPlaybackSaveReason.PAUSE,
+            immediate = true,
+            completed = false,
+            sessionEnded = false,
+            clearPending = false,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        val lastWatched = delegate.lastWatchedStore[500]
+        assertNotNull(lastWatched)
+        // Resume points to current episode (ep1), not next episode (ep2)
+        assertEquals(ep1.id, lastWatched!!.episodeId)
+        assertEquals(35_000L to 100_000L, delegate.viewPosStore[ep1.id])
+    }
+
+    @Test
+    fun `existing next-episode resume position is not overwritten with zero`() {
+        val ep1 = seriesEpisode(id = 1, season = 1, episode = 1, parentId = 500)
+        val ep2 = seriesEpisode(id = 2, season = 1, episode = 2, parentId = 500)
+        val delegate = RecordingHistoryDelegate()
+        // ep2 already had 20 seconds watched in the past
+        delegate.viewPosStore[ep2.id] = 20_000L to 100_000L
+
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "session-6",
+            packageName = PACKAGE,
+            episode = ep1,
+            streamIdentifier = "hash6",
+            initialPositionMs = 0L,
+            expectedDurationMs = DURATION,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = ep2,
+            nextEpisodeResolutionComplete = true,
+        )
+
+        // Complete ep1
+        val update = ExternalPlaybackUpdate(
+            positionMs = 95_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 95_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        // ep1 position is 95s
+        assertEquals(95_000L to 100_000L, delegate.viewPosStore[ep1.id])
+        // ep2 position was NOT overwritten with 0
+        assertEquals(20_000L to 100_000L, delegate.viewPosStore[ep2.id])
+    }
+
+    @Test
+    fun `movies retain existing completion behavior`() {
+        val movie = episode(id = 42, name = "My Movie", duration = 120_000L, tvType = TvType.Movie)
+        val delegate = RecordingHistoryDelegate()
+        delegate.setLastWatched(movie.parentId, movie.id, movie.episode, movie.season)
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "session-movie",
+            packageName = PACKAGE,
+            episode = movie,
+            streamIdentifier = "hash-movie",
+            initialPositionMs = 0L,
+            expectedDurationMs = 120_000L,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = null,
+            nextEpisodeResolutionComplete = false, // Even if false, movie completes cleanly
+        )
+
+        // Movie completed
+        val update = ExternalPlaybackUpdate(
+            positionMs = 115_000L,
+            durationMs = 120_000L,
+            watchedContentMs = 115_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        assertEquals(1, delegate.setViewPosAndResumeCalls.size)
+        assertNull(delegate.setViewPosAndResumeCalls.first().nextEpisode)
+        // Movie is removed from Continue Watching on completion
+        assertNull(delegate.lastWatchedStore[movie.parentId])
+        assertTrue(delegate.removeLastWatchedCalls.contains(movie.parentId))
+    }
+
+    @Test
+    fun `old pending playback JSON without new fields deserializes properly`() {
+        val oldJson = """
+            {
+              "sessionId": "legacy-session-123",
+              "packageName": "com.genuine.leone",
+              "episode": {
+                "headerName": "Season 1",
+                "name": "Legacy Episode",
+                "poster": "https://example.com/poster.jpg",
+                "episode": 1,
+                "seasonIndex": 1,
+                "season": 1,
+                "data": "episode_data",
+                "apiName": "TestApi",
+                "id": 1234,
+                "index": 0,
+                "position": 0,
+                "duration": 100000,
+                "score": null,
+                "description": "Legacy desc",
+                "isFiller": false,
+                "tvType": "TvSeries",
+                "parentId": 100,
+                "videoWatchState": "None"
+              },
+              "streamIdentifier": "stream_id_123",
+              "initialPositionMs": 0,
+              "existingPositionMs": 0,
+              "expectedDurationMs": 100000,
+              "startedAtWallClockMs": 1000,
+              "startedAtElapsedRealtimeMs": 2000,
+              "resumeSeekAttempted": false,
+              "lastObservedPositionMs": 0,
+              "lastObservedDurationMs": 100000,
+              "hasObservedPlayback": false
+            }
+        """.trimIndent()
+
+        val parsed = AppUtils.parseJson<PendingExternalPlayback>(oldJson)
+        assertEquals("legacy-session-123", parsed.sessionId)
+        assertEquals(1234, parsed.episode.id)
+        assertNull(parsed.nextEpisode)
+        assertFalse(parsed.nextEpisodeResolutionComplete)
     }
 }

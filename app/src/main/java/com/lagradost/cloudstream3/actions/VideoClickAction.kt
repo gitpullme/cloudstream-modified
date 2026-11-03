@@ -195,9 +195,19 @@ abstract class VideoClickAction {
     abstract suspend fun runAction(context: Context?, video: ResultEpisode, result: LinkLoadingResult, index: Int?)
 
     /** Safe version of runAction, as we don't trust extension devs to handle exceptions */
-    fun runActionSafe(context: Context?, video: ResultEpisode, result: LinkLoadingResult, index: Int?) = ioSafe {
+    fun runActionSafe(
+        context: Context?,
+        video: ResultEpisode,
+        result: LinkLoadingResult,
+        index: Int?,
+        nextEpisodeContext: ExternalNextEpisodeContext? = null,
+    ) = ioSafe {
         try {
-            runAction(context, video, result, index)
+            if (this is NextEpisodeAwareAction && nextEpisodeContext != null) {
+                runActionWithNextEpisode(context, video, result, index, nextEpisodeContext)
+            } else {
+                runAction(context, video, result, index)
+            }
         }  catch (_ : NotImplementedError) {
             CommonActivity.showToast("runAction has not been implemented for ${name.asStringNull(context)}, please contact the extension developer of $sourcePlugin", Toast.LENGTH_LONG)
         } catch (error : ErrorLoadingException) {
@@ -209,4 +219,27 @@ abstract class VideoClickAction {
             CommonActivity.showToast(t.toString(), Toast.LENGTH_LONG)
         }
     }
+}
+
+/**
+ * Optional contextual metadata about the resolved next episode supplied to external player actions.
+ */
+data class ExternalNextEpisodeContext(
+    val nextEpisode: ResultEpisode? = null,
+    val resolutionComplete: Boolean = false,
+    val isFinalEpisode: Boolean = false,
+)
+
+/**
+ * Optional interface for [VideoClickAction] implementations that can accept next-episode
+ * context for proper watch-history progression without breaking existing plugin signatures.
+ */
+interface NextEpisodeAwareAction {
+    suspend fun runActionWithNextEpisode(
+        context: Context?,
+        video: ResultEpisode,
+        result: LinkLoadingResult,
+        index: Int?,
+        nextEpisodeContext: ExternalNextEpisodeContext,
+    )
 }

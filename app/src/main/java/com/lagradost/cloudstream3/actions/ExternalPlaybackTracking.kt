@@ -9,6 +9,8 @@ import com.lagradost.api.Log
 import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.removeKey
+import com.lagradost.cloudstream3.MainActivity
+import com.lagradost.cloudstream3.isMovieType
 import com.lagradost.cloudstream3.ui.result.ResultEpisode
 import com.lagradost.cloudstream3.utils.DataStore.setKey
 import com.lagradost.cloudstream3.ui.result.ResultFragment
@@ -54,6 +56,8 @@ data class PendingExternalPlayback(
      * a real observation from the initial resume seed stored by [begin].
      */
     @SerialName("hasObservedPlayback") val hasObservedPlayback: Boolean = false,
+    @SerialName("nextEpisode") val nextEpisode: ResultEpisode? = null,
+    @SerialName("nextEpisodeResolutionComplete") val nextEpisodeResolutionComplete: Boolean = false,
 )
 
 enum class ExternalPlaybackState {
@@ -747,6 +751,79 @@ fun interface ExternalPlaybackHistoryWriter {
 }
 
 /**
+ * Pluggable delegate for durable watch history and Continue Watching mutations.
+ * Allows pure JVM testing of history decisions without Android storage or Looper.
+ */
+interface ExternalPlaybackHistoryDelegate {
+    fun setViewPosAndResume(
+        id: Int?,
+        position: Long,
+        duration: Long,
+        currentEpisode: Any?,
+        nextEpisode: Any?,
+    )
+    fun setViewPos(id: Int?, position: Long, duration: Long)
+    fun setLastWatched(
+        parentId: Int?,
+        episodeId: Int?,
+        episode: Int?,
+        season: Int?,
+        isFromDownload: Boolean = false,
+    )
+    fun removeLastWatched(parentId: Int?)
+    fun notifyBookmarksUpdated()
+    fun notifyResultUiUpdated()
+}
+
+object DefaultExternalPlaybackHistoryDelegate : ExternalPlaybackHistoryDelegate {
+    override fun setViewPosAndResume(
+        id: Int?,
+        position: Long,
+        duration: Long,
+        currentEpisode: Any?,
+        nextEpisode: Any?,
+    ) {
+        DataStoreHelper.setViewPosAndResume(id, position, duration, currentEpisode, nextEpisode)
+    }
+
+    override fun setViewPos(id: Int?, position: Long, duration: Long) {
+        DataStoreHelper.setViewPos(id, position, duration)
+    }
+
+    override fun setLastWatched(
+        parentId: Int?,
+        episodeId: Int?,
+        episode: Int?,
+        season: Int?,
+        isFromDownload: Boolean,
+    ) {
+        DataStoreHelper.setLastWatched(parentId, episodeId, episode, season, isFromDownload)
+    }
+
+    override fun removeLastWatched(parentId: Int?) {
+        DataStoreHelper.removeLastWatched(parentId)
+    }
+
+    override fun notifyBookmarksUpdated() {
+        try {
+            MainActivity.bookmarksUpdatedEvent(true)
+        } catch (t: Throwable) {
+            Log.d("ExternalPlayback", "Could not trigger bookmarksUpdatedEvent: ${t.message}")
+        }
+    }
+
+    override fun notifyResultUiUpdated() {
+        try {
+            Handler(Looper.getMainLooper()).post {
+                ResultFragment.updateUI()
+            }
+        } catch (t: Throwable) {
+            Log.d("ExternalPlayback", "Could not post ResultFragment.updateUI(): ${t.message}")
+        }
+    }
+}
+
+/**
  * Durable launch marker. SharedPreferences/DataStore is used only for this
  * short lived marker; episode progress itself always goes through
  * [DataStoreHelper].
@@ -763,6 +840,8 @@ object ExternalPlaybackSessionStore {
         video: ResultEpisode,
         request: ExternalPlaybackRequest,
         packageName: String,
+        nextEpisode: ResultEpisode? = null,
+        nextEpisodeResolutionComplete: Boolean = false,
     ): PendingExternalPlayback? {
         val appContext = context?.applicationContext ?: CloudStreamApp.context ?: return null
         clear("replaced-by-new-launch")
@@ -779,13 +858,16 @@ object ExternalPlaybackSessionStore {
             lastObservedPositionMs = maxOf(request.savedPositionMs, video.position)
                 .coerceAtLeast(0L),
             lastObservedDurationMs = video.duration.coerceAtLeast(0L),
+            nextEpisode = nextEpisode,
+            nextEpisodeResolutionComplete = nextEpisodeResolutionComplete,
         )
         appContext.setKey(PENDING_KEY, pending)
         pushResultSessionId(pending.sessionId)
         Log.d(
             TAG,
             "Pending playback ${pending.sessionId.take(8)} episode=${video.id} " +
-                    "resume=${pending.initialPositionMs}ms duration=${pending.expectedDurationMs}ms"
+                    "resume=${pending.initialPositionMs}ms duration=${pending.expectedDurationMs}ms " +
+                    "nextEpisode=${nextEpisode?.id} complete=$nextEpisodeResolutionComplete"
         )
         return pending
     }
@@ -955,18 +1037,74 @@ object ExternalPlaybackSessionStore {
         }
     }
 
-    private val dataStoreHistoryWriter = ExternalPlaybackHistoryWriter { pending, update ->
-        DataStoreHelper.setViewPosAndResume(
-            id = pending.episode.id,
-            position = update.positionMs,
-            duration = update.durationMs,
-            currentEpisode = pending.episode,
-            nextEpisode = null,
-        )
-        Handler(Looper.getMainLooper()).post {
-            ResultFragment.updateUI()
+    internal var historyDelegate: ExternalPlaybackHistoryDelegate = DefaultExternalPlaybackHistoryDelegate
+
+    fun createHistoryWriter(
+        delegate: ExternalPlaybackHistoryDelegate = historyDelegate
+    ): ExternalPlaybackHistoryWriter = ExternalPlaybackHistoryWriter { pending, update ->
+        val isMovie = pending.episode.tvType.isMovieType()
+        val nextEpisode = pending.nextEpisode
+        val isResolutionComplete = pending.nextEpisodeResolutionComplete
+
+        if (nextEpisode != null) {
+            // Case A: Next episode was resolved.
+            // When progress >= 90%, setViewPosAndResume sets nextEpisode as lastWatched
+            // and sets view pos for pending.episode.id.
+            // When progress < 90%, it sets pending.episode as lastWatched.
+            delegate.setViewPosAndResume(
+                id = pending.episode.id,
+                position = update.positionMs,
+                duration = update.durationMs,
+                currentEpisode = pending.episode,
+                nextEpisode = nextEpisode,
+            )
+        } else if (isMovie || isResolutionComplete) {
+            // Case B: Confirmed final episode or movie.
+            // When progress >= 90%, setViewPosAndResume removes lastWatched for parentId.
+            // When progress < 90%, it sets pending.episode as lastWatched.
+            delegate.setViewPosAndResume(
+                id = pending.episode.id,
+                position = update.positionMs,
+                duration = update.durationMs,
+                currentEpisode = pending.episode,
+                nextEpisode = null,
+            )
+        } else {
+            // Case C: Episodic content where next episode resolution was incomplete/unknown.
+            // Do NOT remove from Continue Watching!
+            if (update.completed) {
+                // Completed, but we don't know the next episode.
+                // Save view pos for current episode.
+                delegate.setViewPos(
+                    id = pending.episode.id,
+                    position = update.positionMs,
+                    duration = update.durationMs,
+                )
+                // Preserve show's last-watched record with current episode.
+                delegate.setLastWatched(
+                    parentId = pending.episode.parentId,
+                    episodeId = pending.episode.id,
+                    episode = pending.episode.episode,
+                    season = pending.episode.season,
+                    isFromDownload = false,
+                )
+            } else {
+                delegate.setViewPosAndResume(
+                    id = pending.episode.id,
+                    position = update.positionMs,
+                    duration = update.durationMs,
+                    currentEpisode = pending.episode,
+                    nextEpisode = null,
+                )
+            }
         }
+
+        delegate.notifyBookmarksUpdated()
+        delegate.notifyResultUiUpdated()
     }
+
+    internal val dataStoreHistoryWriter: ExternalPlaybackHistoryWriter
+        get() = createHistoryWriter(historyDelegate)
 
     private fun streamIdentifier(request: ExternalPlaybackRequest): String {
         val material = buildString {

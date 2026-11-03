@@ -51,6 +51,9 @@ import com.lagradost.cloudstream3.TvSeriesLoadResponse
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.VPNStatus
 import com.lagradost.cloudstream3.actions.AlwaysAskAction
+import com.lagradost.cloudstream3.actions.ExternalNextEpisodeContext
+import com.lagradost.cloudstream3.actions.NextEpisodeResolution
+import com.lagradost.cloudstream3.actions.NextEpisodeResolver
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.isEpisodeBased
@@ -1636,6 +1639,12 @@ class ResultViewModel2 : ViewModel() {
                 }
 
                 activity?.setKey("last_click_action", action.uniqueId())
+                val nextResolution = resolveNextEpisode(click.data)
+                val nextContext = ExternalNextEpisodeContext(
+                    nextEpisode = nextResolution.resolvedEpisode,
+                    resolutionComplete = nextResolution.isComplete,
+                    isFinalEpisode = nextResolution is NextEpisodeResolution.LastEpisode,
+                )
                 if (action.oneSource) {
                     acquireSingleLink(
                         click.data,
@@ -1646,7 +1655,8 @@ class ResultViewModel2 : ViewModel() {
                             activity,
                             click.data,
                             result,
-                            index
+                            index,
+                            nextContext
                         )
                     }
                 } else {
@@ -1655,7 +1665,8 @@ class ResultViewModel2 : ViewModel() {
                             activity,
                             click.data,
                             links,
-                            null
+                            null,
+                            nextContext
                         )
                     }
                 }
@@ -1861,6 +1872,14 @@ class ResultViewModel2 : ViewModel() {
         // we only update here as postEpisodeRange might change the sorting mode if it does not fit
         DataStoreHelper.resultsSortingMode = sortType
         postEpisodeRange(currentIndex, currentRange, sortType)
+    }
+
+    fun resolveNextEpisode(current: ResultEpisode): NextEpisodeResolution {
+        return NextEpisodeResolver.resolveNextEpisode(
+            catalogue = currentEpisodes,
+            current = current,
+            preferredDubStatus = currentIndex?.dubStatus ?: preferDubStatus,
+        )
     }
 
     private fun getMovie(): ResultEpisode? {
