@@ -32,12 +32,6 @@ import androidx.preference.PreferenceManager
 import com.google.android.gms.cast.framework.CastSession
 import com.google.android.material.chip.ChipGroup
 import com.google.android.material.navigationrail.NavigationRailView
-import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
-import com.lagradost.cloudstream3.CloudStreamApp.Companion.removeKey
-import com.lagradost.cloudstream3.actions.ExternalPlaybackSupport
-import com.lagradost.cloudstream3.actions.OpenInAppAction
-import com.lagradost.cloudstream3.actions.VideoClickActionHolder
-import com.lagradost.cloudstream3.actions.temp.NetworkStreamPlayerPackage
 import com.lagradost.cloudstream3.databinding.ToastBinding
 import com.lagradost.cloudstream3.mvvm.logError
 import com.lagradost.cloudstream3.syncproviders.AccountManager
@@ -92,7 +86,11 @@ object CommonActivity {
         return (this as MainActivity?)?.mSessionManager?.currentCastSession
     }
 
-    val displayMetrics: DisplayMetrics = Resources.getSystem().displayMetrics
+    val displayMetrics: DisplayMetrics = try {
+        Resources.getSystem()?.displayMetrics ?: DisplayMetrics()
+    } catch (_: Throwable) {
+        DisplayMetrics()
+    }
 
     // screenWidth and screenHeight does always
     // refer to the screen while in landscape mode
@@ -253,43 +251,6 @@ object CommonActivity {
         componentActivity.updateTv()
         AccountManager.initMainAPI()
         NewPipe.init(DownloaderTestImpl.getInstance())
-
-        MainActivity.activityResultLauncher =
-            componentActivity.registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-                // The external player has returned control, even when it reports
-                // RESULT_CANCELED. Release the relay before handling positions or
-                // cleaning up the stored action.
-                ExternalPlaybackSupport.stopActivePlayback(act)
-
-                val actionUid = getKey<String>("last_click_action")
-                val action = actionUid?.let { uid ->
-                    VideoClickActionHolder.getByUniqueId(uid) as? OpenInAppAction
-                }
-
-                // External players that never call setResult still need a
-                // chance to release tracking state. This must run for
-                // RESULT_CANCELED as well; an empty result is never treated as
-                // completion by the tracker.
-                val externalHandled =
-                    action?.onExternalPlaybackReturned(result.resultCode, result.data) == true
-
-                if (result.resultCode == AppCompatActivity.RESULT_OK) {
-                    if (action != null) {
-                        Log.d(TAG, "Loading action $actionUid result handler")
-                        action.onResultSafe(act, result.data)
-                    }
-                    if (action !is NetworkStreamPlayerPackage || externalHandled) {
-                        removeKey("last_click_action")
-                        removeKey("last_opened")
-                    }
-                } else if (action is NetworkStreamPlayerPackage && externalHandled) {
-                    // Network Stream Player does not set a result. Clear the
-                    // launch marker only when the tracker finalized the matching
-                    // pending launch; a stale result must not clear a newer one.
-                    removeKey("last_click_action")
-                    removeKey("last_opened")
-                }
-            }
 
         // Ask for notification permissions on Android 13
         // Not while biometric locked, the dialog cancels the biometric prompt

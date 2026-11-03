@@ -24,6 +24,13 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.ActivityOptionsCompat
+import androidx.lifecycle.Lifecycle
+import com.lagradost.cloudstream3.actions.ExternalPlaybackSupport
+import com.lagradost.cloudstream3.actions.OpenInAppAction
+import com.lagradost.cloudstream3.actions.VideoClickActionHolder
+import com.lagradost.cloudstream3.actions.temp.NetworkStreamPlayerPackage
 import androidx.annotation.IdRes
 import androidx.annotation.MainThread
 import androidx.appcompat.app.AlertDialog
@@ -196,9 +203,9 @@ import kotlin.math.absoluteValue
 import kotlin.reflect.full.createInstance
 import kotlin.system.exitProcess
 
-class MainActivity : AppCompatActivity(), ColorPickerDialogListener, BiometricCallback {
+open class MainActivity : AppCompatActivity(), ColorPickerDialogListener, BiometricCallback {
     companion object {
-        var activityResultLauncher: ActivityResultLauncher<Intent>? = null
+
 
         const val TAG = "MAINACT"
         const val ANIMATED_OUTLINE: Boolean = false
@@ -712,6 +719,89 @@ class MainActivity : AppCompatActivity(), ColorPickerDialogListener, BiometricCa
         builder.show().setDefaultFocus()
     }
 
+    internal var externalActivityResultLauncher: ActivityResultLauncher<Intent>? = null
+
+    private fun registerExternalActivityResultLauncher() {
+        externalActivityResultLauncher =
+            registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                handleExternalActivityResult(result.resultCode, result.data)
+            }
+    }
+
+    internal fun handleExternalActivityResult(
+        resultCode: Int,
+        data: Intent?,
+        getActionUid: () -> String? = { getKey<String>("last_click_action") },
+        onRemoveKeys: () -> Unit = {
+            removeKey("last_click_action")
+            removeKey("last_opened")
+        }
+    ) {
+        // The external player has returned control, even when it reports
+        // RESULT_CANCELED. Release the relay before handling positions or
+        // cleaning up the stored action.
+        ExternalPlaybackSupport.stopActivePlayback(this)
+
+        val actionUid = getActionUid()
+        val action = actionUid?.let { uid ->
+            VideoClickActionHolder.getByUniqueId(uid) as? OpenInAppAction
+        }
+
+        // External players that never call setResult still need a
+        // chance to release tracking state. This must run for
+        // RESULT_CANCELED as well; an empty result is never treated as
+        // completion by the tracker.
+        val externalHandled =
+            action?.onExternalPlaybackReturned(resultCode, data) == true
+
+        if (resultCode == RESULT_OK) {
+            if (action != null) {
+                Log.d(TAG, "Loading action $actionUid result handler")
+                action.onResultSafe(this, data)
+            }
+            if (action !is NetworkStreamPlayerPackage || externalHandled) {
+                onRemoveKeys()
+            }
+        } else if (action is NetworkStreamPlayerPackage && externalHandled) {
+            // Network Stream Player does not set a result. Clear the
+            // launch marker only when the tracker finalized the matching
+            // pending launch; a stale result must not clear a newer one.
+            onRemoveKeys()
+        }
+    }
+
+    fun launchExternalActivityForResult(
+        intent: Intent,
+        options: ActivityOptionsCompat? = null
+    ) {
+        val finishingOrDestroyed = try {
+            isFinishing || isDestroyed
+        } catch (_: Throwable) {
+            false
+        }
+        if (finishingOrDestroyed) {
+            throw IllegalStateException(
+                "Cannot launch external activity: MainActivity is finishing or destroyed (isFinishing=$isFinishing, isDestroyed=$isDestroyed)"
+            )
+        }
+        val isStarted = try {
+            lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        } catch (_: Throwable) {
+            false
+        }
+        if (!isStarted) {
+            val stateName = try { lifecycle.currentState.name } catch (_: Throwable) { "UNKNOWN" }
+            throw IllegalStateException(
+                "Cannot launch external activity: MainActivity is not at least STARTED (current state: $stateName)"
+            )
+        }
+        val launcher = externalActivityResultLauncher
+            ?: throw IllegalStateException(
+                "Cannot launch external activity: ActivityResultLauncher is not registered on this MainActivity instance"
+            )
+        launcher.launch(intent, options)
+    }
+
     override fun onDestroy() {
         filesToDelete.forEach { path ->
             val result = File(path).deleteRecursively()
@@ -728,6 +818,7 @@ class MainActivity : AppCompatActivity(), ColorPickerDialogListener, BiometricCa
         this.sendBroadcast(broadcastIntent)
         afterPluginsLoadedEvent -= ::onAllPluginsLoaded
         detachBackPressedCallback("MainActivityDefault")
+        externalActivityResultLauncher = null
         super.onDestroy()
     }
 
@@ -1202,6 +1293,7 @@ class MainActivity : AppCompatActivity(), ColorPickerDialogListener, BiometricCa
         setNavigationBarColorCompat(R.attr.primaryGrayBackground)
         updateLocale()
         super.onCreate(savedInstanceState)
+        registerExternalActivityResultLauncher()
         try {
             if (isCastApiAvailable()) {
                 CastContext.getSharedInstance(this) { it.run() }

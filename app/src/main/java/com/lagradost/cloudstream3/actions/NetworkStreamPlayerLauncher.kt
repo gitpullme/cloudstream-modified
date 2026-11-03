@@ -14,6 +14,8 @@ import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.MainActivity
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.utils.AppContextUtils.isAppInstalled
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Dedicated launcher helper for Network Stream (Video) Player (com.genuine.leone).
@@ -269,7 +271,17 @@ object NetworkStreamPlayerLauncher {
         }
         return try {
             val intent = createIntent(activity, request)
-            MainActivity.activityResultLauncher?.launch(intent) ?: run {
+            val mainActivity = (activity as? MainActivity)
+                ?: (CommonActivity.activity as? MainActivity)
+            if (mainActivity != null) {
+                withContext(Dispatchers.Main) {
+                    mainActivity.launchExternalActivityForResult(intent)
+                }
+            } else {
+                if (activity.isFinishing || activity.isDestroyed) {
+                    throw IllegalStateException("Cannot launch from finished or destroyed activity: ${activity::class.java.simpleName}")
+                }
+                Log.w(TAG, "Launching Network Stream Player from non-MainActivity context (${activity::class.java.simpleName}); external activity result callback will not be received")
                 activity.startActivity(intent)
             }
             true

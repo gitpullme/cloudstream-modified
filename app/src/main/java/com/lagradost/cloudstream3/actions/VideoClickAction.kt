@@ -145,7 +145,13 @@ abstract class VideoClickAction {
         }
 
         uiThread {
-            MainActivity.activityResultLauncher?.launch(intent,options)
+            val act = CommonActivity.activity
+                ?: throw IllegalStateException("Cannot launch external activity: No active Activity available")
+            val mainActivity = act as? MainActivity
+                ?: throw IllegalStateException(
+                    "Cannot launch external activity: Current Activity (${act::class.java.simpleName}) is not MainActivity"
+                )
+            mainActivity.launchExternalActivityForResult(intent, options)
         }
     }
 

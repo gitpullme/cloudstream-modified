@@ -26,7 +26,7 @@ import com.lagradost.cloudstream3.utils.txt
  * Handles video playback with full header forwarding, HLS playlist rewriting,
  * subtitle forwarding, and DRM configuration via local loopback proxying when required.
  */
-class NetworkStreamPlayerPackage : OpenInAppAction(
+open class NetworkStreamPlayerPackage : OpenInAppAction(
     appName = txt(R.string.network_stream_player),
     packageName = NetworkStreamPlayerLauncher.PACKAGE_NAME
 ) {
