@@ -312,11 +312,16 @@ object LocalStreamProxyServer : Closeable {
             .followSslRedirects(false)
             .retryOnConnectionFailure(true)
             .addInterceptor { chain ->
-                // Let OkHttp add its own gzip request header and transparently decode
-                // gzip. Never forward a client-controlled Accept-Encoding value.
                 val request = chain.request()
-                if (request.header("Accept-Encoding") != null) {
-                    chain.proceed(request.newBuilder().removeHeader("Accept-Encoding").build())
+                val acceptEncoding = request.header("Accept-Encoding")
+                if (acceptEncoding != null) {
+                    // For range requests or explicit identity encoding, preserve it so
+                    // compressed transfer encoding does not make byte offsets inconsistent.
+                    if (acceptEncoding.equals("identity", ignoreCase = true) || request.header("Range") != null) {
+                        chain.proceed(request)
+                    } else {
+                        chain.proceed(request.newBuilder().removeHeader("Accept-Encoding").build())
+                    }
                 } else {
                     chain.proceed(request)
                 }
@@ -1127,6 +1132,14 @@ object LocalStreamProxyServer : Closeable {
 
             if (forwardRange) {
                 requestBuilder.header("Range", rangeHeader)
+                val hasExplicitEncoding = (specificHeaders?.keys ?: emptySet()).any {
+                    it.equals("accept-encoding", ignoreCase = true)
+                } || session.effectiveHeaders.keys.any {
+                    it.equals("accept-encoding", ignoreCase = true)
+                }
+                if (!hasExplicitEncoding) {
+                    requestBuilder.header("Accept-Encoding", "identity")
+                }
             }
 
             // Bypass stale HTTP cache for HLS playlist refreshes
@@ -1250,7 +1263,7 @@ object LocalStreamProxyServer : Closeable {
                     diag.onComplete()
                     return true
                 } else {
-                    return handleMediaStream(method, response, rangeHeader, clientOut, diag)
+                    return handleMediaStream(method, response, targetUrl, rangeHeader, clientOut, diag)
                 }
             } catch (t: Throwable) {
                 diag.onError("streaming_body", t)
@@ -1406,6 +1419,7 @@ object LocalStreamProxyServer : Closeable {
     private fun handleMediaStream(
         method: String,
         response: Response,
+        targetUrl: String,
         rangeHeader: String?,
         clientOut: OutputStream,
         diag: RequestDiagnostic
@@ -1413,8 +1427,9 @@ object LocalStreamProxyServer : Closeable {
         val responseBody = response.body
         val upstreamCode = response.code
         val contentEncoding = response.header("Content-Encoding")
+        val upstreamAcceptRanges = response.header("Accept-Ranges")
 
-        val rangeSpec = parseRange(rangeHeader)
+        val rangeSpec = parseRangeSpec(rangeHeader)
         val effectiveLength = responseBody.contentLength()
 
         // Check if client requested range, but upstream returned 200 OK.
@@ -1424,11 +1439,34 @@ object LocalStreamProxyServer : Closeable {
 
         val responseHeaders = linkedMapOf(
             "Access-Control-Allow-Origin" to "*",
-            "Accept-Ranges" to "bytes",
             "Connection" to "close"
         )
         response.header("Content-Type")?.let { responseHeaders["Content-Type"] = it }
         contentEncoding?.let { responseHeaders["Content-Encoding"] = it }
+
+        // Forward upstream Content-Disposition or fallback to URL metadata
+        val upstreamDisposition = response.header("Content-Disposition")
+        if (!upstreamDisposition.isNullOrBlank()) {
+            responseHeaders["Content-Disposition"] = upstreamDisposition
+        } else {
+            val fallbackFilename = ExternalMediaMimeResolver.parseContentDispositionFilenameFromUrl(targetUrl)
+            if (!fallbackFilename.isNullOrBlank()) {
+                responseHeaders["Content-Disposition"] = "inline; filename=\"$fallbackFilename\""
+            }
+        }
+
+        // Truthful Accept-Ranges handling
+        if (upstreamAcceptRanges?.equals("none", ignoreCase = true) == true) {
+            responseHeaders["Accept-Ranges"] = "none"
+        } else {
+            val canServiceRangeLocally = effectiveLength >= 0L && contentEncoding == null
+            val upstreamSupportsRanges = upstreamAcceptRanges?.equals("bytes", ignoreCase = true) == true || upstreamCode == 206
+            if (upstreamSupportsRanges || canServiceRangeLocally) {
+                responseHeaders["Accept-Ranges"] = "bytes"
+            } else if (upstreamAcceptRanges != null) {
+                responseHeaders["Accept-Ranges"] = upstreamAcceptRanges
+            }
+        }
 
         var statusCode: Int
         var statusText: String
@@ -1437,11 +1475,9 @@ object LocalStreamProxyServer : Closeable {
         var chunked = false
 
         if (needsLocalRangeSlicing) {
-            val (requestedStart, rawEnd) = rangeSpec
-            val requestedEnd = rawEnd ?: (effectiveLength - 1L)
-            val clampedEnd = requestedEnd.coerceAtMost(effectiveLength - 1L)
-
-            if (requestedStart < effectiveLength && requestedStart <= clampedEnd) {
+            val resolvedRange = rangeSpec.resolve(effectiveLength)
+            if (resolvedRange != null) {
+                val (requestedStart, clampedEnd) = resolvedRange
                 statusCode = 206
                 statusText = "Partial Content"
                 startOffset = requestedStart
@@ -1475,6 +1511,22 @@ object LocalStreamProxyServer : Closeable {
             response.header("ETag")?.let { responseHeaders["ETag"] = it }
             response.header("Last-Modified")?.let { responseHeaders["Last-Modified"] = it }
         }
+
+        Log.i(
+            TAG,
+            "Progressive media stream: method=$method " +
+                    "clientRange=${!rangeHeader.isNullOrBlank()} " +
+                    "requestedRange=${rangeHeader ?: "none"} " +
+                    "forwardedRange=${diag.rangeForwarded} " +
+                    "upstreamStatus=$upstreamCode " +
+                    "locallySliced=$needsLocalRangeSlicing " +
+                    "contentLength=${responseHeaders["Content-Length"] ?: "unknown"} " +
+                    "contentRange=${responseHeaders["Content-Range"] ?: "none"} " +
+                    "acceptRanges=${responseHeaders["Accept-Ranges"] ?: "none"} " +
+                    "contentType=${responseHeaders["Content-Type"] ?: "none"} " +
+                    "contentDisposition=${responseHeaders.containsKey("Content-Disposition")} " +
+                    "contentEncoding=${responseHeaders.containsKey("Content-Encoding")}"
+        )
 
         // Flush status line and headers immediately to the client.
         writeStatusAndHeaders(clientOut, statusCode, statusText, responseHeaders)
@@ -1606,16 +1658,65 @@ object LocalStreamProxyServer : Closeable {
         return true
     }
 
-    fun parseRange(rangeHeader: String?): Pair<Long, Long?>? {
+    sealed class ByteRangeSpec {
+        data class FromStart(val start: Long, val end: Long?) : ByteRangeSpec()
+        data class Suffix(val suffixLength: Long) : ByteRangeSpec()
+
+        fun resolve(totalLength: Long): Pair<Long, Long>? {
+            if (totalLength <= 0L) return null
+            return when (this) {
+                is FromStart -> {
+                    if (start < 0L || start >= totalLength) return null
+                    val resolvedEnd = if (end != null) {
+                        if (end < start) return null
+                        end.coerceAtMost(totalLength - 1L)
+                    } else {
+                        totalLength - 1L
+                    }
+                    Pair(start, resolvedEnd)
+                }
+                is Suffix -> {
+                    if (suffixLength <= 0L) return null
+                    val clampedSuffix = suffixLength.coerceAtMost(totalLength)
+                    val start = totalLength - clampedSuffix
+                    val end = totalLength - 1L
+                    Pair(start, end)
+                }
+            }
+        }
+    }
+
+    fun parseRangeSpec(rangeHeader: String?): ByteRangeSpec? {
         if (rangeHeader.isNullOrBlank() || !rangeHeader.startsWith("bytes=", ignoreCase = true)) {
             return null
         }
         val rangeVal = rangeHeader.substringAfter("=").trim()
+        if (rangeVal.contains(",")) return null
+        if (rangeVal.startsWith("-")) {
+            val suffix = rangeVal.substring(1).trim().toLongOrNull() ?: return null
+            if (suffix <= 0L) return null
+            return ByteRangeSpec.Suffix(suffix)
+        }
         val parts = rangeVal.split("-")
         if (parts.isEmpty()) return null
         val start = parts[0].trim().toLongOrNull() ?: return null
-        val end = if (parts.size > 1 && parts[1].isNotBlank()) parts[1].trim().toLongOrNull() else null
-        return Pair(start, end)
+        if (start < 0L) return null
+        val end = if (parts.size > 1 && parts[1].isNotBlank()) {
+            val parsedEnd = parts[1].trim().toLongOrNull() ?: return null
+            if (parsedEnd < start) return null
+            parsedEnd
+        } else {
+            null
+        }
+        return ByteRangeSpec.FromStart(start, end)
+    }
+
+    fun parseRange(rangeHeader: String?): Pair<Long, Long?>? {
+        val spec = parseRangeSpec(rangeHeader) ?: return null
+        return when (spec) {
+            is ByteRangeSpec.FromStart -> Pair(spec.start, spec.end)
+            is ByteRangeSpec.Suffix -> Pair(-spec.suffixLength, null)
+        }
     }
 
     private fun handleSubtitleRequest(

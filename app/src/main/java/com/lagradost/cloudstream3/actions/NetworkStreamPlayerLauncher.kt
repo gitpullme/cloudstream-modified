@@ -171,6 +171,18 @@ object NetworkStreamPlayerLauncher {
             intent.data = uri
         }
 
+        Log.i(
+            TAG,
+            "Launch configuration: route=$route " +
+                    "ext=${request.detectedExtension ?: "none"} " +
+                    "metadataSource=${request.metadataSource} " +
+                    "requestedMime=${request.mimeType} " +
+                    "effectiveMime=$targetMimeType"
+        )
+        if (route == ExternalPlaybackRoute.DIRECT) {
+            Log.i(TAG, "DIRECT playback active: CloudStream cannot observe external player's subsequent HTTP requests")
+        }
+
         // 2. Title and Playback Metadata. Network Stream Player reads the
         // top-level "name" extra (verified in PlayerActivity.onCreate). The
         // generic title extras are kept for other/older builds.

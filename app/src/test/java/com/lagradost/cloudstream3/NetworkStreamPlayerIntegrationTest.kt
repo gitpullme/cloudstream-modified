@@ -7,6 +7,8 @@ import com.lagradost.cloudstream3.actions.ExternalPlaybackRoute
 import com.lagradost.cloudstream3.actions.ExternalPlaybackSupport
 import com.lagradost.cloudstream3.actions.ExternalSubtitle
 import com.lagradost.cloudstream3.actions.LocalStreamProxyServer
+import com.lagradost.cloudstream3.actions.ExternalMediaMimeResolver
+import com.lagradost.cloudstream3.actions.MediaMetadataSource
 import com.lagradost.cloudstream3.actions.NetworkStreamPlayerLauncher
 import com.lagradost.cloudstream3.actions.OpenInAppAction
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
@@ -3004,6 +3006,407 @@ class NetworkStreamPlayerIntegrationTest {
                 "Unknown resource must be inspected for HLS",
                 LocalStreamProxyServer.hlsInspectionCount.get() > countBeforeBinary
             )
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    // =========================================================================
+    // Regression Tests: Extensionless Signed URLs, MIME Inference, & HTTP Ranges
+    // =========================================================================
+
+    @Test
+    fun `opaque URL with response-content-disposition mkv produces video x-matroska`() {
+        val url = "https://r2.cloudflarestorage.com/bucket/opaque-key-12345?X-Amz-Signature=xyz&response-content-disposition=attachment%3B%20filename%3D%22video.mkv%22"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/x-matroska", request.mimeType)
+        assertEquals(".mkv", request.detectedExtension)
+        assertEquals("video.mkv", request.inferredFilename)
+        assertEquals(MediaMetadataSource.CONTENT_DISPOSITION.label, request.metadataSource)
+        assertEquals(url, request.mediaUrl) // Original signed URL remains byte-for-byte unchanged!
+    }
+
+    @Test
+    fun `opaque URL with response-content-disposition mp4 produces video mp4`() {
+        val url = "https://r2.cloudflarestorage.com/bucket/opaque-key-12345?response-content-disposition=attachment%3B%20filename%3D%22movie.mp4%22"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/mp4", request.mimeType)
+        assertEquals(".mp4", request.detectedExtension)
+        assertEquals("movie.mp4", request.inferredFilename)
+        assertEquals(MediaMetadataSource.CONTENT_DISPOSITION.label, request.metadataSource)
+        assertEquals(url, request.mediaUrl)
+    }
+
+    @Test
+    fun `opaque URL with response-content-disposition webm produces video webm`() {
+        val url = "https://r2.cloudflarestorage.com/bucket/opaque-key-12345?response-content-disposition=attachment%3B%20filename%3D%22clip.webm%22"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/webm", request.mimeType)
+        assertEquals(".webm", request.detectedExtension)
+        assertEquals("clip.webm", request.inferredFilename)
+        assertEquals(MediaMetadataSource.CONTENT_DISPOSITION.label, request.metadataSource)
+    }
+
+    @Test
+    fun `filename star UTF-8 encoding works for Content-Disposition`() {
+        val url = "https://r2.cloudflarestorage.com/bucket/opaque-key-12345?response-content-disposition=attachment%3B%20filename*%3DUTF-8%27%27video%2520file.mkv"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/x-matroska", request.mimeType)
+        assertEquals(".mkv", request.detectedExtension)
+        assertEquals("video file.mkv", request.inferredFilename)
+        assertEquals(MediaMetadataSource.CONTENT_DISPOSITION.label, request.metadataSource)
+    }
+
+    @Test
+    fun `encoded spaces quotes and punctuation are parsed correctly in Content-Disposition`() {
+        val url = "https://r2.cloudflarestorage.com/bucket/opaque-key-12345?response-content-disposition=attachment%3B%20filename%3D%22My%20Show%20-%20S01E01%20%5B1080p%5D.mkv%22"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/x-matroska", request.mimeType)
+        assertEquals("My Show - S01E01 [1080p].mkv", request.inferredFilename)
+    }
+
+    @Test
+    fun `explicit URL path extension takes precedence over conflicting query filename`() {
+        val url = "https://example.com/videos/actual.mp4?response-content-disposition=attachment%3B%20filename%3D%22conflicting.mkv%22"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/mp4", request.mimeType)
+        assertEquals(".mp4", request.detectedExtension)
+        assertEquals("actual.mp4", request.inferredFilename)
+        assertEquals(MediaMetadataSource.URL_PATH.label, request.metadataSource)
+    }
+
+    @Test
+    fun `explicit response-content-type parameter is handled correctly`() {
+        val url = "https://r2.cloudflarestorage.com/bucket/opaque-stream?response-content-type=video%2Fwebm"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/webm", request.mimeType)
+        assertEquals(MediaMetadataSource.RESPONSE_CONTENT_TYPE.label, request.metadataSource)
+    }
+
+    @Test
+    fun `normal URL without a filename retains existing generic fallback`() {
+        val url = "https://example.com/stream/unknown-media"
+        val request = buildTestRequest(url, type = ExtractorLinkType.VIDEO)
+        assertEquals("video/*", request.mimeType)
+        assertEquals(MediaMetadataSource.FALLBACK.label, request.metadataSource)
+        assertEquals(url, request.mediaUrl)
+    }
+
+    @Test
+    fun `parseRangeSpec and parseRange support suffix and reject multipart ranges`() {
+        // Suffix range
+        val suffixSpec = LocalStreamProxyServer.parseRangeSpec("bytes=-1024")
+        assertNotNull(suffixSpec)
+        assertTrue(suffixSpec is LocalStreamProxyServer.ByteRangeSpec.Suffix)
+        assertEquals(1024L, (suffixSpec as LocalStreamProxyServer.ByteRangeSpec.Suffix).suffixLength)
+        assertEquals(Pair(3976L, 4999L), suffixSpec.resolve(5000L))
+        assertEquals(Pair(0L, 499L), suffixSpec.resolve(500L)) // Clamped when suffix >= length
+        assertNull(suffixSpec.resolve(0L))
+        assertEquals(Pair(-1024L, null), LocalStreamProxyServer.parseRange("bytes=-1024"))
+
+        // Standard range from start
+        val fromStartSpec = LocalStreamProxyServer.parseRangeSpec("bytes=1048576-")
+        assertNotNull(fromStartSpec)
+        assertEquals(Pair(1048576L, 1999999L), fromStartSpec!!.resolve(2000000L))
+        assertNull(fromStartSpec.resolve(1000000L)) // Out of bounds
+
+        // Multipart range rejection
+        assertNull(LocalStreamProxyServer.parseRangeSpec("bytes=0-10, 20-30"))
+        assertNull(LocalStreamProxyServer.parseRange("bytes=0-10, 20-30"))
+    }
+
+    @Test
+    fun `progressive file returns 200 with correct Content-Length and Content-Disposition`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val body = ByteArray(1024) { (it % 128).toByte() }
+
+        server.createContext("/stream/sample.mkv") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "video/x-matroska")
+            exchange.responseHeaders.set("Content-Disposition", "attachment; filename=\"sample.mkv\"")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.write(body)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/stream/sample.mkv"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId.mkv"
+
+            val conn = openConnection(proxyUrl)
+            assertEquals(200, conn.responseCode)
+            assertEquals("1024", conn.getHeaderField("Content-Length"))
+            assertEquals("attachment; filename=\"sample.mkv\"", conn.getHeaderField("Content-Disposition"))
+            assertEquals("bytes", conn.getHeaderField("Accept-Ranges"))
+            assertEquals("video/x-matroska", conn.getHeaderField("Content-Type"))
+            assertArrayEquals(body, readAllBytes(conn))
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `proxy forwards Range bytes 0-1023 and preserves valid upstream 206 response with identity encoding`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val slice = ByteArray(1024) { 42 }
+        val rangeReceived = AtomicReference<String>()
+        val acceptEncodingReceived = AtomicReference<String>()
+
+        server.createContext("/stream/range.mkv") { exchange ->
+            rangeReceived.set(exchange.requestHeaders.getFirst("Range"))
+            acceptEncodingReceived.set(exchange.requestHeaders.getFirst("Accept-Encoding"))
+            exchange.responseHeaders.set("Content-Type", "video/x-matroska")
+            exchange.responseHeaders.set("Content-Range", "bytes 0-1023/10000")
+            exchange.sendResponseHeaders(206, slice.size.toLong())
+            exchange.responseBody.write(slice)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/stream/range.mkv"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId.mkv"
+
+            val conn = openConnection(proxyUrl, range = "bytes=0-1023")
+            assertEquals(206, conn.responseCode)
+            assertEquals("bytes=0-1023", rangeReceived.get())
+            assertEquals("identity", acceptEncodingReceived.get())
+            assertEquals("1024", conn.getHeaderField("Content-Length"))
+            assertEquals("bytes 0-1023/10000", conn.getHeaderField("Content-Range"))
+            assertEquals("bytes", conn.getHeaderField("Accept-Ranges"))
+            assertArrayEquals(slice, readAllBytes(conn))
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `proxy handles bytes 1048576- correctly when upstream ignores Range`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val totalSize = 1_500_000
+        val body = ByteArray(totalSize) { (it % 100).toByte() }
+
+        server.createContext("/stream/slice_start.mp4") { exchange ->
+            // Upstream ignores Range header and returns 200 OK
+            exchange.responseHeaders.set("Content-Type", "video/mp4")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.write(body)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/stream/slice_start.mp4"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId.mp4"
+
+            val conn = openConnection(proxyUrl, range = "bytes=1048576-")
+            assertEquals(206, conn.responseCode)
+            val expectedLength = totalSize - 1048576
+            assertEquals(expectedLength.toString(), conn.getHeaderField("Content-Length"))
+            assertEquals("bytes 1048576-1499999/1500000", conn.getHeaderField("Content-Range"))
+            val receivedBytes = readAllBytes(conn)
+            assertEquals(expectedLength, receivedBytes.size)
+            assertArrayEquals(body.copyOfRange(1048576, totalSize), receivedBytes)
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `proxy handles suffix byte ranges correctly when content length is known`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val totalSize = 4000
+        val body = ByteArray(totalSize) { (it % 120).toByte() }
+
+        server.createContext("/stream/suffix.mkv") { exchange ->
+            // Upstream returns 200
+            exchange.responseHeaders.set("Content-Type", "video/x-matroska")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.write(body)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/stream/suffix.mkv"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId.mkv"
+
+            val conn = openConnection(proxyUrl, range = "bytes=-1024")
+            assertEquals(206, conn.responseCode)
+            assertEquals("1024", conn.getHeaderField("Content-Length"))
+            assertEquals("bytes 2976-3999/4000", conn.getHeaderField("Content-Range"))
+            val received = readAllBytes(conn)
+            assertEquals(1024, received.size)
+            assertArrayEquals(body.copyOfRange(2976, 4000), received)
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `unknown-length response does not falsely claim that local byte-range slicing is available`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val body = ByteArray(512) { 33 }
+
+        server.createContext("/stream/unknown_len.bin") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "video/mp4")
+            // 0 as responseLength forces chunked transfer encoding in HttpServer (unknown length)
+            exchange.sendResponseHeaders(200, 0)
+            exchange.responseBody.write(body)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/stream/unknown_len.bin"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId"
+
+            val conn = openConnection(proxyUrl, range = "bytes=0-100")
+            // Must return 200 OK (not 206) because local slicing cannot be safely performed
+            assertEquals(200, conn.responseCode)
+            assertNull("Cannot claim Content-Range for unfulfilled range", conn.getHeaderField("Content-Range"))
+            assertFalse(
+                "Must not advertise Accept-Ranges: bytes when range cannot be serviced",
+                "bytes".equals(conn.getHeaderField("Accept-Ranges"), ignoreCase = true)
+            )
+            assertArrayEquals(body, readAllBytes(conn))
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `compressed response does not get locally sliced using invalid byte offsets`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val originalBody = ByteArray(1000) { 88 }
+        val gzippedBody = gzip(originalBody)
+
+        server.createContext("/stream/compressed.bin") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "video/mp4")
+            exchange.responseHeaders.set("Content-Encoding", "gzip")
+            exchange.sendResponseHeaders(200, gzippedBody.size.toLong())
+            exchange.responseBody.write(gzippedBody)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/stream/compressed.bin"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId"
+
+            val conn = openConnection(proxyUrl, range = "bytes=0-100")
+            // Encoded representation must not be sliced locally
+            assertEquals(200, conn.responseCode)
+            assertNull(conn.getHeaderField("Content-Range"))
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `416 response includes the correct Content-Range`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val body = ByteArray(500) { 1 }
+
+        server.createContext("/stream/small.mp4") { exchange ->
+            exchange.responseHeaders.set("Content-Type", "video/mp4")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.write(body)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/stream/small.mp4"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId.mp4"
+
+            // Request out-of-range byte range
+            val conn = openConnection(proxyUrl, range = "bytes=1000-2000")
+            assertEquals(416, conn.responseCode)
+            assertEquals("bytes */500", conn.getHeaderField("Content-Range"))
+        } finally {
+            session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
+            server.stop(0)
+            LocalStreamProxyServer.resetForTest()
+        }
+    }
+
+    @Test
+    fun `proxy infers Content-Disposition filename from request URL metadata as fallback`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val serverPort = server.address.port
+        val body = ByteArray(256) { 9 }
+
+        server.createContext("/bucket/opaque-key") { exchange ->
+            // Upstream does not return Content-Disposition
+            exchange.responseHeaders.set("Content-Type", "video/x-matroska")
+            exchange.sendResponseHeaders(200, body.size.toLong())
+            exchange.responseBody.write(body)
+            exchange.responseBody.close()
+        }
+        server.start()
+
+        var session: LocalStreamProxyServer.ProxySession? = null
+        try {
+            val upstream = "http://127.0.0.1:$serverPort/bucket/opaque-key?response-content-disposition=attachment%3B%20filename%3D%22fallback_movie.mkv%22"
+            session = LocalStreamProxyServer.startSession(buildTestRequest(upstream, type = ExtractorLinkType.VIDEO))
+            val proxyPort = LocalStreamProxyServer.ensureStarted()
+            val resId = session.registerResource(upstream)
+            val proxyUrl = "http://127.0.0.1:$proxyPort/session/${session.sessionId}/res/$resId.mkv"
+
+            val conn = openConnection(proxyUrl)
+            assertEquals(200, conn.responseCode)
+            assertEquals("inline; filename=\"fallback_movie.mkv\"", conn.getHeaderField("Content-Disposition"))
+            assertArrayEquals(body, readAllBytes(conn))
         } finally {
             session?.let { LocalStreamProxyServer.stopSession(it.sessionId) }
             server.stop(0)

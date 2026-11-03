@@ -72,7 +72,10 @@ data class ExternalPlaybackRequest(
     val rawExtractorLink: ExtractorLink? = null,
     val masterUrl: String? = null,
     val masterHeaders: Map<String, String> = emptyMap(),
-    val allVariants: List<HlsVariant> = emptyList()
+    val allVariants: List<HlsVariant> = emptyList(),
+    val detectedExtension: String? = null,
+    val metadataSource: String = "fallback",
+    val inferredFilename: String? = null
 ) {
     /**
      * Deterministic direct-versus-proxy choice.
@@ -189,22 +192,8 @@ object ExternalPlaybackRequestBuilder {
         val userAgent = findHeader("user-agent") ?: USER_AGENT
         val authorization = findHeader("authorization")
 
-        val mimeType = when (link.type) {
-            ExtractorLinkType.M3U8 -> "application/vnd.apple.mpegurl"
-            ExtractorLinkType.DASH -> "application/dash+xml"
-            ExtractorLinkType.VIDEO -> {
-                val cleanUrl = link.url.substringBefore("?")
-                when {
-                    cleanUrl.endsWith(".m3u8", ignoreCase = true) -> "application/vnd.apple.mpegurl"
-                    cleanUrl.endsWith(".mpd", ignoreCase = true) -> "application/dash+xml"
-                    cleanUrl.endsWith(".mp4", ignoreCase = true) -> "video/mp4"
-                    cleanUrl.endsWith(".mkv", ignoreCase = true) -> "video/x-matroska"
-                    cleanUrl.endsWith(".webm", ignoreCase = true) -> "video/webm"
-                    else -> "video/*"
-                }
-            }
-            else -> "video/*"
-        }
+        val resolvedMetadata = ExternalMediaMimeResolver.resolve(link.url, link.type)
+        val mimeType = resolvedMetadata.mimeType
 
         // The selected ExtractorLink is the source of truth. A master URL is
         // recorded only when the selected link itself is an explicitly declared
@@ -304,7 +293,10 @@ object ExternalPlaybackRequestBuilder {
             rawExtractorLink = link,
             masterUrl = masterUrl,
             masterHeaders = masterHeaders,
-            allVariants = emptyList()
+            allVariants = emptyList(),
+            detectedExtension = resolvedMetadata.extension,
+            metadataSource = resolvedMetadata.source.label,
+            inferredFilename = resolvedMetadata.filename
         )
     }
 }
