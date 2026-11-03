@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.CloudStreamApp.Companion.removeKey
 import com.lagradost.cloudstream3.MainActivity
 import com.lagradost.cloudstream3.isMovieType
 import com.lagradost.cloudstream3.ui.result.ResultEpisode
+import com.lagradost.cloudstream3.ui.result.VideoWatchState
 import com.lagradost.cloudstream3.utils.DataStore.setKey
 import com.lagradost.cloudstream3.ui.result.ResultFragment
 import com.lagradost.cloudstream3.utils.DataStoreHelper
@@ -58,6 +59,7 @@ data class PendingExternalPlayback(
     @SerialName("hasObservedPlayback") val hasObservedPlayback: Boolean = false,
     @SerialName("nextEpisode") val nextEpisode: ResultEpisode? = null,
     @SerialName("nextEpisodeResolutionComplete") val nextEpisodeResolutionComplete: Boolean = false,
+    @SerialName("isRewatchOfCompletedEpisode") val isRewatchOfCompletedEpisode: Boolean = false,
 )
 
 enum class ExternalPlaybackState {
@@ -730,6 +732,7 @@ class ExternalPlaybackProgressEngine(
      * seek was unsupported.
      */
     private fun mustPreserveResume(position: Long): Boolean {
+        if (pending.isRewatchOfCompletedEpisode) return false
         val existingPosition = maxOf(pending.existingPositionMs, pending.initialPositionMs)
         if (existingPosition <= 0L) return false
         if (resumeSeekConfirmed) return false
@@ -771,6 +774,7 @@ interface ExternalPlaybackHistoryDelegate {
         isFromDownload: Boolean = false,
     )
     fun removeLastWatched(parentId: Int?)
+    fun clearEpisodeWatchState(episodeId: Int?)
     fun notifyBookmarksUpdated()
     fun notifyResultUiUpdated()
 }
@@ -804,6 +808,11 @@ object DefaultExternalPlaybackHistoryDelegate : ExternalPlaybackHistoryDelegate 
         DataStoreHelper.removeLastWatched(parentId)
     }
 
+    override fun clearEpisodeWatchState(episodeId: Int?) {
+        if (episodeId == null) return
+        DataStoreHelper.setVideoWatchState(episodeId, VideoWatchState.None)
+    }
+
     override fun notifyBookmarksUpdated() {
         try {
             MainActivity.bookmarksUpdatedEvent(true)
@@ -835,6 +844,41 @@ object ExternalPlaybackSessionStore {
     private const val MAX_PENDING_AGE_MS = 12 * 60 * 60 * 1_000L
     private const val MAX_RESULT_QUEUE = 4
 
+    fun isCompletedEpisode(
+        video: ResultEpisode,
+        request: ExternalPlaybackRequest? = null,
+    ): Boolean {
+        val storedWatchState = try {
+            DataStoreHelper.getVideoWatchState(video.id)
+        } catch (_: Throwable) {
+            null
+        }
+        val effectiveWatchState = storedWatchState ?: video.videoWatchState
+        if (effectiveWatchState == VideoWatchState.Watched) {
+            return true
+        }
+
+        val storedPosDur = try {
+            DataStoreHelper.getViewPos(video.id)
+        } catch (_: Throwable) {
+            null
+        }
+        val savedPos = storedPosDur?.position
+            ?: request?.savedPositionMs?.takeIf { it > 0L }
+            ?: video.position
+        val savedDur = storedPosDur?.duration?.takeIf { it > 0L }
+            ?: video.duration.takeIf { it > 0L }
+            ?: request?.savedPositionMs ?: 0L
+
+        if (savedDur > 0L && savedPos > 0L) {
+            val percentage = savedPos * 100L / savedDur
+            if (percentage >= ExternalPlaybackProgressEngine.COMPLETION_PERCENT) {
+                return true
+            }
+        }
+        return false
+    }
+
     fun begin(
         context: Context?,
         video: ResultEpisode,
@@ -842,9 +886,11 @@ object ExternalPlaybackSessionStore {
         packageName: String,
         nextEpisode: ResultEpisode? = null,
         nextEpisodeResolutionComplete: Boolean = false,
+        isRewatchOfCompletedEpisode: Boolean? = null,
     ): PendingExternalPlayback? {
         val appContext = context?.applicationContext ?: CloudStreamApp.context ?: return null
         clear("replaced-by-new-launch")
+        val rewatch = isRewatchOfCompletedEpisode ?: isCompletedEpisode(video, request)
         val pending = PendingExternalPlayback(
             sessionId = UUID.randomUUID().toString(),
             packageName = packageName,
@@ -860,6 +906,7 @@ object ExternalPlaybackSessionStore {
             lastObservedDurationMs = video.duration.coerceAtLeast(0L),
             nextEpisode = nextEpisode,
             nextEpisodeResolutionComplete = nextEpisodeResolutionComplete,
+            isRewatchOfCompletedEpisode = rewatch,
         )
         appContext.setKey(PENDING_KEY, pending)
         pushResultSessionId(pending.sessionId)
@@ -867,7 +914,8 @@ object ExternalPlaybackSessionStore {
             TAG,
             "Pending playback ${pending.sessionId.take(8)} episode=${video.id} " +
                     "resume=${pending.initialPositionMs}ms duration=${pending.expectedDurationMs}ms " +
-                    "nextEpisode=${nextEpisode?.id} complete=$nextEpisodeResolutionComplete"
+                    "nextEpisode=${nextEpisode?.id} complete=$nextEpisodeResolutionComplete " +
+                    "isRewatch=$rewatch"
         )
         return pending
     }
@@ -1046,7 +1094,19 @@ object ExternalPlaybackSessionStore {
         val nextEpisode = pending.nextEpisode
         val isResolutionComplete = pending.nextEpisodeResolutionComplete
 
-        if (nextEpisode != null) {
+        if (pending.isRewatchOfCompletedEpisode) {
+            // Rewatch branch (highest priority):
+            // 1. Save new position and duration for this episode/movie
+            delegate.setViewPos(
+                id = pending.episode.id,
+                position = update.positionMs,
+                duration = update.durationMs,
+            )
+            // 2. Clear old Watched marker so UI reflects new progress accurately
+            delegate.clearEpisodeWatchState(pending.episode.id)
+            // Note: Never call setViewPosAndResume, setLastWatched, or removeLastWatched.
+            // Home Continue Watching remains completely untouched!
+        } else if (nextEpisode != null) {
             // Case A: Next episode was resolved.
             // When progress >= 90%, setViewPosAndResume sets nextEpisode as lastWatched
             // and sets view pos for pending.episode.id.

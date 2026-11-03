@@ -74,6 +74,7 @@ class ExternalPlaybackTrackingTest {
         name: String = "Test Movie",
         resumeSeekAttempted: Boolean = false,
         tvType: TvType = TvType.Movie,
+        isRewatchOfCompletedEpisode: Boolean = false,
     ): PendingExternalPlayback {
         return PendingExternalPlayback(
             sessionId = "pending-1",
@@ -86,6 +87,7 @@ class ExternalPlaybackTrackingTest {
             startedAtWallClockMs = 1_000L,
             startedAtElapsedRealtimeMs = START,
             resumeSeekAttempted = resumeSeekAttempted,
+            isRewatchOfCompletedEpisode = isRewatchOfCompletedEpisode,
         )
     }
 
@@ -1725,11 +1727,13 @@ class ExternalPlaybackTrackingTest {
         val setViewPosCalls = mutableListOf<ViewPosCall>()
         val setLastWatchedCalls = mutableListOf<LastWatchedCall>()
         val removeLastWatchedCalls = mutableListOf<Int?>()
+        val clearWatchStateCalls = mutableListOf<Int?>()
         var bookmarksUpdatedCount = 0
         var resultUiUpdatedCount = 0
 
         val viewPosStore = mutableMapOf<Int, Pair<Long, Long>>()
         val lastWatchedStore = mutableMapOf<Int, LastWatchedEntry>()
+        val watchStateStore = mutableMapOf<Int, VideoWatchState>()
 
         data class ViewPosAndResumeCall(
             val id: Int?,
@@ -1818,6 +1822,13 @@ class ExternalPlaybackTrackingTest {
             removeLastWatchedCalls.add(parentId)
             if (parentId != null) {
                 lastWatchedStore.remove(parentId)
+            }
+        }
+
+        override fun clearEpisodeWatchState(episodeId: Int?) {
+            clearWatchStateCalls.add(episodeId)
+            if (episodeId != null) {
+                watchStateStore[episodeId] = VideoWatchState.None
             }
         }
 
@@ -2301,5 +2312,422 @@ class ExternalPlaybackTrackingTest {
         assertEquals(1234, parsed.episode.id)
         assertNull(parsed.nextEpisode)
         assertFalse(parsed.nextEpisodeResolutionComplete)
+        assertFalse(parsed.isRewatchOfCompletedEpisode)
+    }
+
+    // -------------------------------------------------------------------------
+    // Rewatch Detection regression tests
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `episode with VideoWatchState Watched is detected as a rewatch`() {
+        val ep = seriesEpisode(id = 1, season = 1, episode = 1)
+            .copy(videoWatchState = VideoWatchState.Watched, position = 0L)
+        assertTrue(ExternalPlaybackSessionStore.isCompletedEpisode(ep))
+    }
+
+    @Test
+    fun `episode with saved position at or above completion threshold is detected as a rewatch`() {
+        // 95% of 100_000 is 95_000
+        val epAt95 = seriesEpisode(id = 2, season = 1, episode = 2)
+            .copy(position = 95_000L, duration = 100_000L, videoWatchState = VideoWatchState.None)
+        assertTrue(ExternalPlaybackSessionStore.isCompletedEpisode(epAt95))
+
+        val epAt98 = seriesEpisode(id = 3, season = 1, episode = 3)
+            .copy(position = 98_000L, duration = 100_000L, videoWatchState = VideoWatchState.None)
+        assertTrue(ExternalPlaybackSessionStore.isCompletedEpisode(epAt98))
+    }
+
+    @Test
+    fun `movie with previously completed progress is detected as a rewatch`() {
+        val movie = episode(id = 10, duration = 120_000L, tvType = TvType.Movie)
+            .copy(position = 119_000L, videoWatchState = VideoWatchState.None)
+        assertTrue(ExternalPlaybackSessionStore.isCompletedEpisode(movie))
+    }
+
+    @Test
+    fun `unfinished episode is not detected as a rewatch`() {
+        val unfinished = seriesEpisode(id = 4, season = 1, episode = 4)
+            .copy(position = 50_000L, duration = 100_000L, videoWatchState = VideoWatchState.None)
+        assertFalse(ExternalPlaybackSessionStore.isCompletedEpisode(unfinished))
+    }
+
+    @Test
+    fun `new episode with zero saved position is not detected as a rewatch`() {
+        val newEp = seriesEpisode(id = 5, season = 1, episode = 5)
+            .copy(position = 0L, duration = 100_000L, videoWatchState = VideoWatchState.None)
+        assertFalse(ExternalPlaybackSessionStore.isCompletedEpisode(newEp))
+    }
+
+    // -------------------------------------------------------------------------
+    // Progress Engine Rewatch regression tests
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `normal unfinished episode preserves saved resume position before seek confirmation`() {
+        val engine = ExternalPlaybackProgressEngine(
+            pending(initialPositionMs = 60_000L, isRewatchOfCompletedEpisode = false)
+        )
+        bind(engine, positionMs = 0L)
+
+        // Player starts at zero before seeking to resume position: must not overwrite saved 60s
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+            )
+        )
+        assertNull("Normal unfinished episode must guard against 0 position overwrite", update)
+        assertEquals(-1L, engine.lastPersistedPositionMs)
+    }
+
+    @Test
+    fun `intentional rewatch bypasses old completed-position guard`() {
+        val engine = ExternalPlaybackProgressEngine(
+            pending(
+                initialPositionMs = 0L,
+                existingPositionMs = 98_000L,
+                isRewatchOfCompletedEpisode = true,
+            )
+        )
+        bind(engine, positionMs = 0L)
+
+        // Player starts at zero for a rewatch and advances to 5s.
+        // It must NOT be blocked by the previous 98s completed position.
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 5_000L,
+                observedAtElapsedMs = at(6),
+            )
+        )
+        assertNotNull("Rewatch must bypass resume guard and emit update", update)
+        assertEquals(5_000L, update!!.positionMs)
+    }
+
+    @Test
+    fun `rewatch starting at zero can save its new progressing position without waiting 60 seconds`() {
+        val engine = ExternalPlaybackProgressEngine(
+            pending(
+                initialPositionMs = 0L,
+                existingPositionMs = 100_000L,
+                isRewatchOfCompletedEpisode = true,
+            )
+        )
+        bind(engine, positionMs = 0L)
+
+        // Advance 10 seconds: saves without needing 60 seconds of watchedContentMs
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 10_000L,
+                observedAtElapsedMs = at(11),
+            )
+        )
+        assertNotNull(update)
+        assertEquals(10_000L, update!!.positionMs)
+        assertTrue(update.watchedContentMs < 60_000L)
+    }
+
+    @Test
+    fun `rewatch that seeks to a different timestamp can subsequently save the new position`() {
+        val engine = ExternalPlaybackProgressEngine(
+            pending(
+                initialPositionMs = 0L,
+                existingPositionMs = 100_000L,
+                isRewatchOfCompletedEpisode = true,
+            )
+        )
+        bind(engine, positionMs = 0L)
+
+        // User seeks to 35s
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 35_000L,
+                observedAtElapsedMs = at(6),
+            )
+        )
+        assertNotNull(update)
+        assertEquals(35_000L, update!!.positionMs)
+    }
+
+    @Test
+    fun `stale sessions and out-of-order MediaSession observations remain rejected even for rewatches`() {
+        val engine = ExternalPlaybackProgressEngine(
+            pending(
+                initialPositionMs = 0L,
+                existingPositionMs = 100_000L,
+                isRewatchOfCompletedEpisode = true,
+            )
+        )
+        bind(engine, positionMs = 0L)
+
+        // Observation from wrong session token must be ignored
+        val updateStale = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 20_000L,
+                observedAtElapsedMs = at(6),
+                sessionToken = "token-other",
+            )
+        )
+        assertNull(updateStale)
+
+        // Out-of-order observation from the past must be rejected
+        val updatePast = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 15_000L,
+                observedAtElapsedMs = at(0),
+                sessionToken = "token-1",
+            )
+        )
+        assertNull(updatePast)
+    }
+
+    @Test
+    fun `non-rewatch does not accidentally inherit rewatch exception`() {
+        val engine = ExternalPlaybackProgressEngine(
+            pending(
+                initialPositionMs = 0L,
+                existingPositionMs = 96_000L,
+                isRewatchOfCompletedEpisode = false,
+            )
+        )
+        bind(engine, positionMs = 0L)
+
+        // Progress below threshold is guarded
+        val update = engine.onSnapshot(
+            snapshot(
+                state = ExternalPlaybackState.PLAYING,
+                positionMs = 10_000L,
+                observedAtElapsedMs = at(11),
+            )
+        )
+        assertNull("Non-rewatch must not bypass the resume guard", update)
+    }
+
+    // -------------------------------------------------------------------------
+    // History writer and Home pointer regression tests
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `intentional rewatch of series episode updates position and clears watch state without touching last watched`() {
+        val ep1 = seriesEpisode(id = 10, season = 1, episode = 1, parentId = 500)
+        val delegate = RecordingHistoryDelegate()
+        // Pre-populate last watched pointing to episode 5 (user was on episode 5)
+        delegate.setLastWatched(500, 50, 5, 1)
+        val initialLastWatched = delegate.lastWatchedStore[500]
+
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "rewatch-1",
+            packageName = PACKAGE,
+            episode = ep1,
+            streamIdentifier = "hash-rewatch-1",
+            initialPositionMs = 0L,
+            existingPositionMs = 100_000L,
+            expectedDurationMs = 100_000L,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = seriesEpisode(id = 20, season = 1, episode = 2, parentId = 500),
+            nextEpisodeResolutionComplete = true,
+            isRewatchOfCompletedEpisode = true,
+        )
+
+        // Rewatching at 40%
+        val update = ExternalPlaybackUpdate(
+            positionMs = 40_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 40_000L,
+            state = ExternalPlaybackState.PAUSED,
+            reason = ExternalPlaybackSaveReason.PAUSE,
+            immediate = true,
+            completed = false,
+            sessionEnded = false,
+            clearPending = false,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        // 1. Position is updated
+        assertEquals(40_000L to 100_000L, delegate.viewPosStore[ep1.id])
+        // 2. Old Watched marker is cleared
+        assertTrue(delegate.clearWatchStateCalls.contains(ep1.id))
+        assertEquals(VideoWatchState.None, delegate.watchStateStore[ep1.id])
+        // 3. Last watched is NEVER modified
+        assertTrue(delegate.setViewPosAndResumeCalls.isEmpty())
+        assertEquals(1, delegate.setLastWatchedCalls.size) // only initial setup
+        assertTrue(delegate.removeLastWatchedCalls.isEmpty())
+        assertEquals(initialLastWatched, delegate.lastWatchedStore[500])
+        assertEquals(50, delegate.lastWatchedStore[500]?.episodeId)
+    }
+
+    @Test
+    fun `intentional rewatch that reaches completion threshold still does not modify Home Continue Watching`() {
+        val ep1 = seriesEpisode(id = 10, season = 1, episode = 1, parentId = 500)
+        val delegate = RecordingHistoryDelegate()
+        delegate.setLastWatched(500, 50, 5, 1)
+
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "rewatch-2",
+            packageName = PACKAGE,
+            episode = ep1,
+            streamIdentifier = "hash-rewatch-2",
+            initialPositionMs = 0L,
+            existingPositionMs = 100_000L,
+            expectedDurationMs = 100_000L,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = seriesEpisode(id = 20, season = 1, episode = 2, parentId = 500),
+            nextEpisodeResolutionComplete = true,
+            isRewatchOfCompletedEpisode = true,
+        )
+
+        // Rewatch fully reaches 98%
+        val update = ExternalPlaybackUpdate(
+            positionMs = 98_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 98_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        // Position is updated to 98%
+        assertEquals(98_000L to 100_000L, delegate.viewPosStore[ep1.id])
+        // Home Continue Watching MUST NOT advance to ep 2 or remove ep 5
+        assertTrue(delegate.setViewPosAndResumeCalls.isEmpty())
+        assertTrue(delegate.removeLastWatchedCalls.isEmpty())
+        assertEquals(50, delegate.lastWatchedStore[500]?.episodeId)
+    }
+
+    @Test
+    fun `intentional rewatch of movie updates position without removing last watched`() {
+        val movie = episode(id = 77, name = "My Favorite Movie", duration = 120_000L, tvType = TvType.Movie)
+        val delegate = RecordingHistoryDelegate()
+        delegate.setLastWatched(movie.parentId, movie.id, movie.episode, movie.season)
+
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+        val pendingPlayback = PendingExternalPlayback(
+            sessionId = "rewatch-movie",
+            packageName = PACKAGE,
+            episode = movie,
+            streamIdentifier = "hash-rewatch-movie",
+            initialPositionMs = 0L,
+            existingPositionMs = 120_000L,
+            expectedDurationMs = 120_000L,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = null,
+            nextEpisodeResolutionComplete = true,
+            isRewatchOfCompletedEpisode = true,
+        )
+
+        // Movie rewatched to 60s
+        val update = ExternalPlaybackUpdate(
+            positionMs = 60_000L,
+            durationMs = 120_000L,
+            watchedContentMs = 60_000L,
+            state = ExternalPlaybackState.PAUSED,
+            reason = ExternalPlaybackSaveReason.PAUSE,
+            immediate = true,
+            completed = false,
+            sessionEnded = false,
+            clearPending = false,
+        )
+
+        writer.write(pendingPlayback, update)
+
+        assertEquals(60_000L to 120_000L, delegate.viewPosStore[movie.id])
+        assertTrue(delegate.clearWatchStateCalls.contains(movie.id))
+        assertTrue(delegate.removeLastWatchedCalls.isEmpty())
+        assertNotNull(delegate.lastWatchedStore[movie.parentId])
+    }
+
+    @Test
+    fun `rewatch with resolved next episode, final episode, or unknown next episode all use rewatch branch`() {
+        val delegate = RecordingHistoryDelegate()
+        val writer = ExternalPlaybackSessionStore.createHistoryWriter(delegate)
+
+        // 1. With resolved next episode
+        val pendingWithNext = PendingExternalPlayback(
+            sessionId = "r-1",
+            packageName = PACKAGE,
+            episode = seriesEpisode(id = 1, season = 1, episode = 1, parentId = 100),
+            streamIdentifier = "h-1",
+            initialPositionMs = 0L,
+            existingPositionMs = 100_000L,
+            expectedDurationMs = 100_000L,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = seriesEpisode(id = 2, season = 1, episode = 2, parentId = 100),
+            nextEpisodeResolutionComplete = true,
+            isRewatchOfCompletedEpisode = true,
+        )
+
+        // 2. Confirmed final episode
+        val pendingFinal = PendingExternalPlayback(
+            sessionId = "r-2",
+            packageName = PACKAGE,
+            episode = seriesEpisode(id = 9, season = 1, episode = 9, parentId = 100),
+            streamIdentifier = "h-2",
+            initialPositionMs = 0L,
+            existingPositionMs = 100_000L,
+            expectedDurationMs = 100_000L,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = null,
+            nextEpisodeResolutionComplete = true,
+            isRewatchOfCompletedEpisode = true,
+        )
+
+        // 3. Unknown next episode
+        val pendingUnknown = PendingExternalPlayback(
+            sessionId = "r-3",
+            packageName = PACKAGE,
+            episode = seriesEpisode(id = 5, season = 1, episode = 5, parentId = 100),
+            streamIdentifier = "h-3",
+            initialPositionMs = 0L,
+            existingPositionMs = 100_000L,
+            expectedDurationMs = 100_000L,
+            startedAtWallClockMs = 1_000L,
+            startedAtElapsedRealtimeMs = START,
+            nextEpisode = null,
+            nextEpisodeResolutionComplete = false,
+            isRewatchOfCompletedEpisode = true,
+        )
+
+        val completedUpdate = ExternalPlaybackUpdate(
+            positionMs = 95_000L,
+            durationMs = 100_000L,
+            watchedContentMs = 95_000L,
+            state = ExternalPlaybackState.STOPPED,
+            reason = ExternalPlaybackSaveReason.STOP,
+            immediate = true,
+            completed = true,
+            sessionEnded = true,
+            clearPending = true,
+        )
+
+        writer.write(pendingWithNext, completedUpdate)
+        writer.write(pendingFinal, completedUpdate)
+        writer.write(pendingUnknown, completedUpdate)
+
+        // All 3 used the rewatch branch: 3 setViewPos calls, 3 clearEpisodeWatchState calls
+        assertEquals(3, delegate.setViewPosCalls.size)
+        assertEquals(3, delegate.clearWatchStateCalls.size)
+        // Never called setViewPosAndResume, setLastWatched, or removeLastWatched
+        assertTrue(delegate.setViewPosAndResumeCalls.isEmpty())
+        assertTrue(delegate.setLastWatchedCalls.isEmpty())
+        assertTrue(delegate.removeLastWatchedCalls.isEmpty())
     }
 }
